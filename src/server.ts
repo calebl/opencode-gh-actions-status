@@ -9,14 +9,14 @@ import {
   type ShellFn,
 } from "./gh.js"
 
-interface PluginConfig {
+export interface PluginConfig {
   branch?: string
   limit?: number
   workflows?: string[]
   pollInterval?: number
 }
 
-function parseOptions(options?: PluginOptions): PluginConfig {
+export function parseOptions(options?: PluginOptions): PluginConfig {
   if (!options) return {}
   return {
     branch: typeof options.branch === "string" ? options.branch : undefined,
@@ -70,6 +70,63 @@ export const server: Plugin = async (input, options) => {
     return cachedRuns
   }
 
+  const client = input.client
+
+  // Track last toast key to avoid showing the same toast on every idle event
+  let lastToastKey = ""
+
+  async function showStatusToast() {
+    let runs: WorkflowRun[]
+    try {
+      runs = await getRuns()
+    } catch {
+      return
+    }
+
+    if (runs.length === 0) return
+
+    const levels = runs.map(mapStatus)
+    const hasError = levels.includes("error")
+    const hasWarning = levels.includes("warning")
+    const hasInfo = levels.includes("info") // in-progress / queued
+
+    const variant: "success" | "warning" | "error" | "info" = hasError
+      ? "error"
+      : hasWarning
+        ? "warning"
+        : hasInfo
+          ? "info"
+          : "success"
+
+    // Build a short summary, e.g. "2 passing · 1 failing"
+    const counts = {
+      success: levels.filter((l) => l === "success").length,
+      error: levels.filter((l) => l === "error").length,
+      warning: levels.filter((l) => l === "warning").length,
+      info: levels.filter((l) => l === "info").length,
+    }
+    const parts: string[] = []
+    if (counts.success) parts.push(`${counts.success} passing`)
+    if (counts.error) parts.push(`${counts.error} failing`)
+    if (counts.warning) parts.push(`${counts.warning} cancelled`)
+    if (counts.info) parts.push(`${counts.info} running`)
+    const summary = parts.join(" · ")
+
+    // Deduplicate: skip if nothing changed since last toast
+    const toastKey = `${variant}:${summary}`
+    if (toastKey === lastToastKey) return
+    lastToastKey = toastKey
+
+    await client.tui.showToast({
+      body: {
+        title: "GitHub Actions",
+        message: summary,
+        variant,
+        duration: 6000,
+      },
+    })
+  }
+
   // The sidebar hook is supported at runtime but not yet in the published
   // @opencode-ai/plugin type definitions (see sst/opencode#5971).
   interface SidebarPanelItem {
@@ -89,6 +146,12 @@ export const server: Plugin = async (input, options) => {
   }
 
   const hooks: HooksWithSidebar = {
+    event: async ({ event }) => {
+      if (event.type === "session.idle") {
+        await showStatusToast()
+      }
+    },
+
     sidebar: [
       {
         id: "gh-actions",
