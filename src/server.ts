@@ -42,12 +42,30 @@ export const server: Plugin = async (input, options) => {
   let cachedRuns: WorkflowRun[] = []
   let lastFetch = 0
   const pollInterval = config.pollInterval ?? 30_000
+  let fetchPromise: Promise<WorkflowRun[]> | null = null
+  let lastFetchError: string | null = null
 
   async function getRuns(): Promise<WorkflowRun[]> {
     const now = Date.now()
     if (now - lastFetch > pollInterval) {
-      cachedRuns = await fetchWorkflowRuns($, ghOptions)
-      lastFetch = now
+      if (!fetchPromise) {
+        fetchPromise = fetchWorkflowRuns($, ghOptions)
+          .then((runs) => {
+            cachedRuns = runs
+            lastFetchError = null
+            lastFetch = Date.now()
+            fetchPromise = null
+            return runs
+          })
+          .catch((err: unknown) => {
+            lastFetchError =
+              err instanceof Error ? err.message : "Unknown error fetching workflow runs"
+            lastFetch = Date.now()
+            fetchPromise = null
+            return cachedRuns
+          })
+      }
+      return fetchPromise
     }
     return cachedRuns
   }
@@ -77,6 +95,9 @@ export const server: Plugin = async (input, options) => {
         title: "GitHub Actions",
         items: async () => {
           const runs = await getRuns()
+          if (lastFetchError) {
+            return [{ label: `Error: ${lastFetchError}`, status: "error" as const }]
+          }
           if (runs.length === 0) {
             return [{ label: "No workflow runs found" }]
           }
@@ -107,11 +128,17 @@ export const server: Plugin = async (input, options) => {
             .describe("Maximum number of runs to return (default: 5)"),
         },
         async execute(args) {
-          const runs = await fetchWorkflowRuns($, {
-            branch: args.branch ?? ghOptions.branch,
-            limit: args.limit ?? ghOptions.limit,
-            workflows: ghOptions.workflows,
-          })
+          let runs: WorkflowRun[]
+          try {
+            runs = await fetchWorkflowRuns($, {
+              branch: args.branch ?? ghOptions.branch,
+              limit: args.limit ?? ghOptions.limit,
+              workflows: ghOptions.workflows,
+            })
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : "Unknown error"
+            return `Failed to fetch workflow runs: ${message}`
+          }
 
           if (runs.length === 0) {
             return "No workflow runs found for the current branch."
@@ -119,14 +146,9 @@ export const server: Plugin = async (input, options) => {
 
           const lines = runs.map((run) => {
             const status = formatStatus(run)
+            const level = mapStatus(run)
             const icon =
-              mapStatus(run) === "success"
-                ? "✓"
-                : mapStatus(run) === "error"
-                  ? "✗"
-                  : mapStatus(run) === "warning"
-                    ? "⚠"
-                    : "●"
+              level === "success" ? "✓" : level === "error" ? "✗" : level === "warning" ? "⚠" : "●"
             return `${icon} ${run.name}: ${status} (${run.displayTitle})\n  ${run.url}`
           })
 

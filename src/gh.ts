@@ -70,20 +70,14 @@ export async function fetchWorkflowRuns(
     }
   }
 
-  const ghArgs = args.join(" ")
+  const result = await $`gh ${args}`.quiet().text()
+  const parsed = JSON.parse(result.trim())
 
-  try {
-    const result = await $`gh ${ghArgs}`.quiet().text()
-    const parsed = JSON.parse(result.trim())
-
-    if (!Array.isArray(parsed)) {
-      return []
-    }
-
-    return parsed as WorkflowRun[]
-  } catch {
+  if (!Array.isArray(parsed)) {
     return []
   }
+
+  return parsed as WorkflowRun[]
 }
 
 export type StatusLevel = "success" | "error" | "warning" | "info"
