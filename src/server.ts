@@ -2,7 +2,8 @@ import { tool } from "@opencode-ai/plugin"
 import type { Plugin, Hooks, PluginOptions } from "@opencode-ai/plugin"
 import {
   fetchWorkflowRuns,
-  groupRunsByTrigger,
+  filterRunsByCommit,
+  getHeadCommitSha,
   mapStatus,
   formatStatus,
   type WorkflowRun,
@@ -132,7 +133,7 @@ export const server: Plugin = async (input, options) => {
   let pollHandle: unknown = null
 
   function isRunActive(runs: WorkflowRun[]): boolean {
-    return groupRunsByTrigger(runs).some(
+    return runs.some(
       (r) =>
         r.status === "in_progress" ||
         r.status === "queued" ||
@@ -145,8 +146,8 @@ export const server: Plugin = async (input, options) => {
     variant: "success" | "warning" | "error" | "info"
     summary: string
   } {
-    // Only summarise runs from the same trigger as the newest run
-    const levels = groupRunsByTrigger(runs).map(mapStatus)
+    // runs is already filtered to the current HEAD commit
+    const levels = runs.map(mapStatus)
     const variant: "success" | "warning" | "error" | "info" = levels.includes("error")
       ? "error"
       : levels.includes("warning")
@@ -219,7 +220,19 @@ export const server: Plugin = async (input, options) => {
       return
     }
 
-    const newestId = runs[0].databaseId
+    // Filter to only runs for the current HEAD commit (skip in mock mode)
+    let commitRuns = runs
+    if (mockSnapshots === null) {
+      const headSha = await getHeadCommitSha($)
+      if (headSha) commitRuns = filterRunsByCommit(runs, headSha)
+    }
+
+    if (commitRuns.length === 0) {
+      stopPolling()
+      return
+    }
+
+    const newestId = commitRuns[0].databaseId
     const isNew = newestId !== trackedRunId
 
     if (isNew && trackedRunId !== null) {
@@ -228,8 +241,8 @@ export const server: Plugin = async (input, options) => {
     }
 
     trackedRunId = newestId
-    const active = isRunActive(runs)
-    const { variant, summary } = buildToastPayload(runs)
+    const active = isRunActive(commitRuns)
+    const { variant, summary } = buildToastPayload(commitRuns)
     const toastKey = `${variant}:${summary}`
 
     if (toastKey !== lastToastKey) {
@@ -289,10 +302,12 @@ export const server: Plugin = async (input, options) => {
           if (lastFetchError) {
             return [{ label: `Error: ${lastFetchError}`, status: "error" as const }]
           }
-          if (runs.length === 0) {
-            return [{ label: "No workflow runs found" }]
+          const headSha = await getHeadCommitSha($)
+          const commitRuns = headSha ? filterRunsByCommit(runs, headSha) : runs
+          if (commitRuns.length === 0) {
+            return [{ label: "No workflow runs found for current commit" }]
           }
-          return runs.map((run) => ({
+          return commitRuns.map((run) => ({
             label: run.name,
             value: formatStatus(run),
             status: mapStatus(run),
@@ -331,11 +346,15 @@ export const server: Plugin = async (input, options) => {
             return `Failed to fetch workflow runs: ${message}`
           }
 
-          if (runs.length === 0) {
-            return "No workflow runs found for the current branch."
+          // Filter to only runs for the current HEAD commit
+          const headSha = await getHeadCommitSha($)
+          const commitRuns = headSha ? filterRunsByCommit(runs, headSha) : runs
+
+          if (commitRuns.length === 0) {
+            return "No workflow runs found for the current commit."
           }
 
-          const lines = runs.map((run) => {
+          const lines = commitRuns.map((run) => {
             const status = formatStatus(run)
             const level = mapStatus(run)
             const icon =

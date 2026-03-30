@@ -3,8 +3,9 @@ import {
   mapStatus,
   formatStatus,
   getCurrentBranch,
+  getHeadCommitSha,
   fetchWorkflowRuns,
-  groupRunsByTrigger,
+  filterRunsByCommit,
   type WorkflowRun,
   type ShellFn,
 } from "./gh.js"
@@ -20,6 +21,7 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     status: "completed",
     conclusion: "success",
     headBranch: "main",
+    headSha: "abc123",
     event: "push",
     url: "https://github.com/owner/repo/actions/runs/1",
     displayTitle: "test commit",
@@ -205,41 +207,49 @@ describe("fetchWorkflowRuns", () => {
 })
 
 // ---------------------------------------------------------------------------
-// groupRunsByTrigger
+// getHeadCommitSha
 // ---------------------------------------------------------------------------
 
-describe("groupRunsByTrigger", () => {
+describe("getHeadCommitSha", () => {
+  it("returns trimmed commit SHA", async () => {
+    const $ = makeShell("  abc123def456\n")
+    expect(await getHeadCommitSha($)).toBe("abc123def456")
+  })
+
+  it("returns empty string when shell throws", async () => {
+    const $ = vi.fn().mockReturnValue({
+      quiet: () => ({ text: () => Promise.reject(new Error("not a git repo")) }),
+    }) as unknown as ShellFn
+    expect(await getHeadCommitSha($)).toBe("")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// filterRunsByCommit
+// ---------------------------------------------------------------------------
+
+describe("filterRunsByCommit", () => {
   it("returns empty array for empty input", () => {
-    expect(groupRunsByTrigger([])).toEqual([])
+    expect(filterRunsByCommit([], "abc123")).toEqual([])
   })
 
-  it("includes runs within the default 60 s window of the newest", () => {
-    const newest = makeRun({ createdAt: "2024-01-01T00:01:00Z" })
-    const within = makeRun({ createdAt: "2024-01-01T00:00:30Z" }) // 30 s before
-    const old = makeRun({ createdAt: "2024-01-01T00:00:00Z" })    // 60 s before — on the edge, included
-    const older = makeRun({ createdAt: "2023-12-31T23:59:59Z" })  // 61 s before — excluded
-
-    const result = groupRunsByTrigger([newest, within, old, older])
-    expect(result).toHaveLength(3)
-    expect(result).not.toContain(older)
+  it("returns all runs when sha is empty", () => {
+    const runs = [makeRun({ headSha: "abc123" }), makeRun({ headSha: "def456" })]
+    expect(filterRunsByCommit(runs, "")).toHaveLength(2)
   })
 
-  it("respects a custom window", () => {
-    const newest = makeRun({ createdAt: "2024-01-01T00:01:00Z" })
-    const tenSecondsAgo = makeRun({ createdAt: "2024-01-01T00:00:50Z" })
-    const twentySecondsAgo = makeRun({ createdAt: "2024-01-01T00:00:40Z" })
+  it("returns only runs matching the given SHA", () => {
+    const match1 = makeRun({ databaseId: 1, headSha: "abc123" })
+    const match2 = makeRun({ databaseId: 2, headSha: "abc123" })
+    const other = makeRun({ databaseId: 3, headSha: "def456" })
 
-    const result = groupRunsByTrigger([newest, tenSecondsAgo, twentySecondsAgo], 15_000)
+    const result = filterRunsByCommit([match1, match2, other], "abc123")
     expect(result).toHaveLength(2)
-    expect(result).not.toContain(twentySecondsAgo)
+    expect(result).not.toContain(other)
   })
 
-  it("returns all runs when they all fall within the window", () => {
-    const runs = [
-      makeRun({ createdAt: "2024-01-01T00:01:00Z" }),
-      makeRun({ createdAt: "2024-01-01T00:01:01Z" }),
-      makeRun({ createdAt: "2024-01-01T00:01:02Z" }),
-    ]
-    expect(groupRunsByTrigger(runs)).toHaveLength(3)
+  it("returns empty array when no runs match the SHA", () => {
+    const runs = [makeRun({ headSha: "abc123" }), makeRun({ headSha: "abc123" })]
+    expect(filterRunsByCommit(runs, "zzz999")).toHaveLength(0)
   })
 })

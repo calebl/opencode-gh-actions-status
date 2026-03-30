@@ -74,6 +74,8 @@ describe("parseOptions", () => {
 
 let runIdCounter = 1
 
+const TEST_HEAD_SHA = "deadbeef1234"
+
 function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
   return {
     databaseId: runIdCounter++,
@@ -81,6 +83,7 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     status: "completed",
     conclusion: "success",
     headBranch: "main",
+    headSha: TEST_HEAD_SHA,
     event: "push",
     url: "https://github.com/owner/repo/actions/runs/1",
     displayTitle: "test commit",
@@ -90,16 +93,28 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
   }
 }
 
-/** Build a PluginInput mock whose shell always returns the given runs. */
+/**
+ * Build a PluginInput mock whose shell handles:
+ *   git branch --show-current  → "main"
+ *   git rev-parse HEAD          → TEST_HEAD_SHA
+ *   gh run list …               → runsJson
+ * Any extra calls fall back to runsJson.
+ */
 function makeInput(runs: WorkflowRun[]) {
   const runsJson = JSON.stringify(runs)
   const showToast = vi.fn().mockResolvedValue(undefined)
 
   const $ = vi
     .fn()
-    .mockReturnValueOnce({ quiet: () => ({ text: () => Promise.resolve("main\n") }) })
-    .mockReturnValue({
-      quiet: () => ({ text: () => Promise.resolve(runsJson) }),
+    .mockImplementation((strings: TemplateStringsArray, ...args: unknown[]) => {
+      const cmd = strings.raw.join("").trim() + (args.length ? " " + args.join(" ") : "")
+      if (cmd.includes("branch --show-current")) {
+        return { quiet: () => ({ text: () => Promise.resolve("main\n") }) }
+      }
+      if (cmd.includes("rev-parse HEAD")) {
+        return { quiet: () => ({ text: () => Promise.resolve(TEST_HEAD_SHA + "\n") }) }
+      }
+      return { quiet: () => ({ text: () => Promise.resolve(runsJson) }) }
     }) as unknown as ShellFn
 
   const input = {
@@ -247,15 +262,21 @@ describe("server — toast on session.idle", () => {
     const updatedRun = { ...activeRun, updatedAt: "2024-01-01T00:02:00Z" }
 
     const showToast = vi.fn().mockResolvedValue(undefined)
+    let callCount = 0
     const $ = vi
       .fn()
-      .mockReturnValueOnce({ quiet: () => ({ text: () => Promise.resolve("main\n") }) })
-      .mockReturnValueOnce({
-        quiet: () => ({ text: () => Promise.resolve(JSON.stringify([activeRun])) }),
-      })
-      .mockReturnValueOnce({ quiet: () => ({ text: () => Promise.resolve("main\n") }) })
-      .mockReturnValueOnce({
-        quiet: () => ({ text: () => Promise.resolve(JSON.stringify([updatedRun])) }),
+      .mockImplementation((strings: TemplateStringsArray, ...args: unknown[]) => {
+        const cmd = strings.raw.join("").trim() + (args.length ? " " + args.join(" ") : "")
+        if (cmd.includes("branch --show-current")) {
+          return { quiet: () => ({ text: () => Promise.resolve("main\n") }) }
+        }
+        if (cmd.includes("rev-parse HEAD")) {
+          return { quiet: () => ({ text: () => Promise.resolve(TEST_HEAD_SHA + "\n") }) }
+        }
+        // First gh call returns activeRun, second returns updatedRun
+        callCount++
+        const payload = callCount === 1 ? [activeRun] : [updatedRun]
+        return { quiet: () => ({ text: () => Promise.resolve(JSON.stringify(payload)) }) }
       }) as unknown as ShellFn
 
     const input = {
@@ -269,7 +290,7 @@ describe("server — toast on session.idle", () => {
 
     const hooks = await server(input)
     await fireIdle(hooks)
-    await vi.runAllTimersAsync()
+    await vi.runOnlyPendingTimersAsync()
     // First tick: 1 toast (in_progress)
     expect(showToast).toHaveBeenCalledTimes(1)
 
@@ -284,17 +305,21 @@ describe("server — toast on session.idle", () => {
     const secondRun = makeRun({ databaseId: 200, conclusion: "failure" })
 
     const showToast = vi.fn().mockResolvedValue(undefined)
+    let ghCallCount = 0
     const $ = vi
       .fn()
-      // First idle: branch + first run
-      .mockReturnValueOnce({ quiet: () => ({ text: () => Promise.resolve("main\n") }) })
-      .mockReturnValueOnce({
-        quiet: () => ({ text: () => Promise.resolve(JSON.stringify([firstRun])) }),
-      })
-      // Second idle (polling restarts): branch + second run
-      .mockReturnValueOnce({ quiet: () => ({ text: () => Promise.resolve("main\n") }) })
-      .mockReturnValueOnce({
-        quiet: () => ({ text: () => Promise.resolve(JSON.stringify([secondRun])) }),
+      .mockImplementation((strings: TemplateStringsArray, ...args: unknown[]) => {
+        const cmd = strings.raw.join("").trim() + (args.length ? " " + args.join(" ") : "")
+        if (cmd.includes("branch --show-current")) {
+          return { quiet: () => ({ text: () => Promise.resolve("main\n") }) }
+        }
+        if (cmd.includes("rev-parse HEAD")) {
+          return { quiet: () => ({ text: () => Promise.resolve(TEST_HEAD_SHA + "\n") }) }
+        }
+        // First gh call returns firstRun, second returns secondRun
+        ghCallCount++
+        const payload = ghCallCount === 1 ? [firstRun] : [secondRun]
+        return { quiet: () => ({ text: () => Promise.resolve(JSON.stringify(payload)) }) }
       }) as unknown as ShellFn
 
     const input = {

@@ -4,6 +4,7 @@ export interface WorkflowRun {
   status: string
   conclusion: string | null
   headBranch: string
+  headSha: string
   event: string
   url: string
   displayTitle: string
@@ -28,6 +29,7 @@ const GH_FIELDS = [
   "status",
   "conclusion",
   "headBranch",
+  "headSha",
   "event",
   "url",
   "displayTitle",
@@ -38,6 +40,15 @@ const GH_FIELDS = [
 export async function getCurrentBranch($: ShellFn): Promise<string> {
   try {
     const result = await $`git branch --show-current`.quiet().text()
+    return result.trim()
+  } catch {
+    return ""
+  }
+}
+
+export async function getHeadCommitSha($: ShellFn): Promise<string> {
+  try {
+    const result = await $`git rev-parse HEAD`.quiet().text()
     return result.trim()
   } catch {
     return ""
@@ -83,15 +94,12 @@ export async function fetchWorkflowRuns(
 }
 
 /**
- * Returns only the runs that belong to the same trigger as the newest run.
- * Runs are considered part of the same trigger if their createdAt is within
- * `windowMs` milliseconds of the most recent run's createdAt (default 60 s).
- * This prevents stale runs from older pushes polluting the toast summary.
+ * Returns only the runs that belong to the given commit SHA.
+ * This ensures we only show runs for the most recent commit.
  */
-export function groupRunsByTrigger(runs: WorkflowRun[], windowMs = 60_000): WorkflowRun[] {
-  if (runs.length === 0) return []
-  const newestTime = new Date(runs[0].createdAt).getTime()
-  return runs.filter((r) => newestTime - new Date(r.createdAt).getTime() <= windowMs)
+export function filterRunsByCommit(runs: WorkflowRun[], sha: string): WorkflowRun[] {
+  if (!sha || runs.length === 0) return runs
+  return runs.filter((r) => r.headSha === sha)
 }
 
 export type StatusLevel = "success" | "error" | "warning" | "info"
