@@ -27,6 +27,9 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@emnapi/core": "^1.9.1",
+    "@emnapi/runtime": "^1.9.1",
+    "@emnapi/wasi-threads": "^1.2.0",
     "@tsconfig/node22": "^22.0.2",
     "typescript": "^5.8.2",
     "vitest": "^4.1.2"
