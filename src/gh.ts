@@ -1,4 +1,5 @@
 export interface WorkflowRun {
+  databaseId: number
   name: string
   status: string
   conclusion: string | null
@@ -22,6 +23,7 @@ export type ShellFn = (
 ) => { quiet(): { text(): Promise<string> } }
 
 const GH_FIELDS = [
+  "databaseId",
   "name",
   "status",
   "conclusion",

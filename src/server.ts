@@ -14,6 +14,24 @@ export interface PluginConfig {
   limit?: number
   workflows?: string[]
   pollInterval?: number
+  /**
+   * When set, the plugin returns these runs instead of calling `gh`.
+   * Each element is a snapshot; the plugin cycles through them on each poll
+   * tick so you can simulate in_progress → completed without a real CI run.
+   *
+   * Example opencode.json entry:
+   * ["./dist/index.js", {
+   *   "mockRuns": [
+   *     [{ "databaseId": 1, "name": "CI", "status": "in_progress", "conclusion": null,
+   *        "headBranch": "main", "event": "push", "url": "https://github.com/x/y/runs/1",
+   *        "displayTitle": "mock", "createdAt": "2024-01-01T00:00:00Z", "updatedAt": "2024-01-01T00:00:00Z" }],
+   *     [{ "databaseId": 1, "name": "CI", "status": "completed", "conclusion": "success",
+   *        "headBranch": "main", "event": "push", "url": "https://github.com/x/y/runs/1",
+   *        "displayTitle": "mock", "createdAt": "2024-01-01T00:00:00Z", "updatedAt": "2024-01-01T00:01:00Z" }]
+   *   ]
+   * }]
+   */
+  mockRuns?: WorkflowRun[][]
 }
 
 export function parseOptions(options?: PluginOptions): PluginConfig {
@@ -26,6 +44,9 @@ export function parseOptions(options?: PluginOptions): PluginConfig {
       : undefined,
     pollInterval:
       typeof options.pollInterval === "number" ? options.pollInterval : undefined,
+    mockRuns: Array.isArray(options.mockRuns)
+      ? (options.mockRuns as WorkflowRun[][]).filter(Array.isArray)
+      : undefined,
   }
 }
 
@@ -45,7 +66,20 @@ export const server: Plugin = async (input, options) => {
   let fetchPromise: Promise<WorkflowRun[]> | null = null
   let lastFetchError: string | null = null
 
+  // Mock cycle state: index advances on every getRuns() call so each poll tick
+  // returns the next snapshot, wrapping at the last one.
+  const mockSnapshots = config.mockRuns ?? null
+  let mockIndex = 0
+
   async function getRuns(): Promise<WorkflowRun[]> {
+    // Short-circuit to mock data when configured
+    if (mockSnapshots !== null) {
+      const snapshot = mockSnapshots[Math.min(mockIndex, mockSnapshots.length - 1)]
+      mockIndex = Math.min(mockIndex + 1, mockSnapshots.length - 1)
+      cachedRuns = snapshot
+      return snapshot
+    }
+
     const now = Date.now()
     if (now - lastFetch > pollInterval) {
       if (!fetchPromise) {
@@ -72,33 +106,53 @@ export const server: Plugin = async (input, options) => {
 
   const client = input.client
 
-  // Track last toast key to avoid showing the same toast on every idle event
+  // ── Toast lifecycle state ──────────────────────────────────────────────────
+  // We poll independently of session.idle so toasts appear as soon as a run
+  // starts and are refreshed every 10 s while runs are active.
+  //
+  // Lifecycle:
+  //   • A new run is detected  → show toast immediately, start 10 s polling
+  //   • Run still in progress  → refresh toast every 10 s
+  //   • Run reaches final state → show final toast with a 30-minute duration
+  //   • A brand-new run starts  → dismiss current toast immediately, restart
+  //
+  // "Dismiss" is achieved by sending a new toast with duration = 1 ms.
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const _setInterval: (fn: () => void, ms: number) => unknown = (globalThis as any).setInterval
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const _clearInterval: (id: unknown) => void = (globalThis as any).clearInterval
+
+  // ID of the most-recent run we are tracking (databaseId of runs[0])
+  let trackedRunId: number | null = null
+  // Key of the last toast we sent (variant:summary) – used to skip no-op updates
   let lastToastKey = ""
+  // setInterval handle for the active polling loop
+  let pollHandle: unknown = null
 
-  async function showStatusToast() {
-    let runs: WorkflowRun[]
-    try {
-      runs = await getRuns()
-    } catch {
-      return
-    }
+  function isRunActive(runs: WorkflowRun[]): boolean {
+    return runs.some(
+      (r) =>
+        r.status === "in_progress" ||
+        r.status === "queued" ||
+        r.status === "waiting" ||
+        r.status === "pending",
+    )
+  }
 
-    if (runs.length === 0) return
-
+  function buildToastPayload(runs: WorkflowRun[]): {
+    variant: "success" | "warning" | "error" | "info"
+    summary: string
+  } {
     const levels = runs.map(mapStatus)
-    const hasError = levels.includes("error")
-    const hasWarning = levels.includes("warning")
-    const hasInfo = levels.includes("info") // in-progress / queued
-
-    const variant: "success" | "warning" | "error" | "info" = hasError
+    const variant: "success" | "warning" | "error" | "info" = levels.includes("error")
       ? "error"
-      : hasWarning
+      : levels.includes("warning")
         ? "warning"
-        : hasInfo
+        : levels.includes("info")
           ? "info"
           : "success"
 
-    // Build a short summary, e.g. "2 passing · 1 failing"
     const counts = {
       success: levels.filter((l) => l === "success").length,
       error: levels.filter((l) => l === "error").length,
@@ -106,25 +160,95 @@ export const server: Plugin = async (input, options) => {
       info: levels.filter((l) => l === "info").length,
     }
     const parts: string[] = []
+    if (counts.info) parts.push(`${counts.info} running`)
     if (counts.success) parts.push(`${counts.success} passing`)
     if (counts.error) parts.push(`${counts.error} failing`)
     if (counts.warning) parts.push(`${counts.warning} cancelled`)
-    if (counts.info) parts.push(`${counts.info} running`)
-    const summary = parts.join(" · ")
+    return { variant, summary: parts.join(" · ") }
+  }
 
-    // Deduplicate: skip if nothing changed since last toast
-    const toastKey = `${variant}:${summary}`
-    if (toastKey === lastToastKey) return
-    lastToastKey = toastKey
-
+  async function sendToast(
+    variant: "success" | "warning" | "error" | "info",
+    summary: string,
+    duration: number,
+  ) {
     await client.tui.showToast({
       body: {
         title: "GitHub Actions",
         message: summary,
         variant,
-        duration: 6000,
+        duration,
       },
     })
+  }
+
+  async function dismissToast() {
+    // Sending a 1 ms duration effectively dismisses the current toast
+    await client.tui.showToast({
+      body: {
+        title: "GitHub Actions",
+        message: "",
+        variant: "info",
+        duration: 1,
+      },
+    })
+    lastToastKey = ""
+  }
+
+  function stopPolling() {
+    if (pollHandle !== null) {
+      _clearInterval(pollHandle)
+      pollHandle = null
+    }
+  }
+
+  async function tickToast() {
+    let runs: WorkflowRun[]
+    try {
+      // Bypass the cache so we always get fresh data on each tick
+      lastFetch = 0
+      runs = await getRuns()
+    } catch {
+      return
+    }
+
+    if (runs.length === 0) {
+      stopPolling()
+      return
+    }
+
+    const newestId = runs[0].databaseId
+    const isNew = newestId !== trackedRunId
+
+    if (isNew && trackedRunId !== null) {
+      // A brand-new run appeared – dismiss the old toast first
+      await dismissToast()
+    }
+
+    trackedRunId = newestId
+    const active = isRunActive(runs)
+    const { variant, summary } = buildToastPayload(runs)
+    const toastKey = `${variant}:${summary}`
+
+    if (toastKey !== lastToastKey) {
+      const duration = active
+        ? 10_500 // slightly longer than the poll interval so it stays visible
+        : 30 * 60 * 1000 // 30 minutes for a final state
+      await sendToast(variant, summary, duration)
+      lastToastKey = toastKey
+    }
+
+    if (!active) {
+      // Run has finished – no need to keep polling
+      stopPolling()
+    }
+  }
+
+  function startPolling() {
+    if (pollHandle !== null) return // already running
+    // Fire immediately, then repeat every 10 s
+    void tickToast()
+    pollHandle = _setInterval(() => void tickToast(), 10_000)
   }
 
   // The sidebar hook is supported at runtime but not yet in the published
@@ -148,7 +272,9 @@ export const server: Plugin = async (input, options) => {
   const hooks: HooksWithSidebar = {
     event: async ({ event }) => {
       if (event.type === "session.idle") {
-        await showStatusToast()
+        // Start polling for runs whenever the session goes idle (i.e. after
+        // the agent finishes a turn and might have triggered a CI run).
+        startPolling()
       }
     },
 

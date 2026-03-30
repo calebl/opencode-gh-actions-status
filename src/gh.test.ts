@@ -14,6 +14,7 @@ import {
 
 function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
   return {
+    databaseId: 1,
     name: "CI",
     status: "completed",
     conclusion: "success",
