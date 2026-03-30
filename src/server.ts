@@ -2,6 +2,7 @@ import { tool } from "@opencode-ai/plugin"
 import type { Plugin, Hooks, PluginOptions } from "@opencode-ai/plugin"
 import {
   fetchWorkflowRuns,
+  groupRunsByTrigger,
   mapStatus,
   formatStatus,
   type WorkflowRun,
@@ -131,7 +132,7 @@ export const server: Plugin = async (input, options) => {
   let pollHandle: unknown = null
 
   function isRunActive(runs: WorkflowRun[]): boolean {
-    return runs.some(
+    return groupRunsByTrigger(runs).some(
       (r) =>
         r.status === "in_progress" ||
         r.status === "queued" ||
@@ -144,7 +145,8 @@ export const server: Plugin = async (input, options) => {
     variant: "success" | "warning" | "error" | "info"
     summary: string
   } {
-    const levels = runs.map(mapStatus)
+    // Only summarise runs from the same trigger as the newest run
+    const levels = groupRunsByTrigger(runs).map(mapStatus)
     const variant: "success" | "warning" | "error" | "info" = levels.includes("error")
       ? "error"
       : levels.includes("warning")

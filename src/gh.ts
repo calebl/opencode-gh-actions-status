@@ -82,6 +82,18 @@ export async function fetchWorkflowRuns(
   return parsed as WorkflowRun[]
 }
 
+/**
+ * Returns only the runs that belong to the same trigger as the newest run.
+ * Runs are considered part of the same trigger if their createdAt is within
+ * `windowMs` milliseconds of the most recent run's createdAt (default 60 s).
+ * This prevents stale runs from older pushes polluting the toast summary.
+ */
+export function groupRunsByTrigger(runs: WorkflowRun[], windowMs = 60_000): WorkflowRun[] {
+  if (runs.length === 0) return []
+  const newestTime = new Date(runs[0].createdAt).getTime()
+  return runs.filter((r) => newestTime - new Date(r.createdAt).getTime() <= windowMs)
+}
+
 export type StatusLevel = "success" | "error" | "warning" | "info"
 
 export function mapStatus(run: WorkflowRun): StatusLevel {

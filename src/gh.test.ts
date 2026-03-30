@@ -4,6 +4,7 @@ import {
   formatStatus,
   getCurrentBranch,
   fetchWorkflowRuns,
+  groupRunsByTrigger,
   type WorkflowRun,
   type ShellFn,
 } from "./gh.js"
@@ -200,5 +201,45 @@ describe("fetchWorkflowRuns", () => {
 
     const result = await fetchWorkflowRuns($, { limit: 3 })
     expect(result).toHaveLength(3)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// groupRunsByTrigger
+// ---------------------------------------------------------------------------
+
+describe("groupRunsByTrigger", () => {
+  it("returns empty array for empty input", () => {
+    expect(groupRunsByTrigger([])).toEqual([])
+  })
+
+  it("includes runs within the default 60 s window of the newest", () => {
+    const newest = makeRun({ createdAt: "2024-01-01T00:01:00Z" })
+    const within = makeRun({ createdAt: "2024-01-01T00:00:30Z" }) // 30 s before
+    const old = makeRun({ createdAt: "2024-01-01T00:00:00Z" })    // 60 s before — on the edge, included
+    const older = makeRun({ createdAt: "2023-12-31T23:59:59Z" })  // 61 s before — excluded
+
+    const result = groupRunsByTrigger([newest, within, old, older])
+    expect(result).toHaveLength(3)
+    expect(result).not.toContain(older)
+  })
+
+  it("respects a custom window", () => {
+    const newest = makeRun({ createdAt: "2024-01-01T00:01:00Z" })
+    const tenSecondsAgo = makeRun({ createdAt: "2024-01-01T00:00:50Z" })
+    const twentySecondsAgo = makeRun({ createdAt: "2024-01-01T00:00:40Z" })
+
+    const result = groupRunsByTrigger([newest, tenSecondsAgo, twentySecondsAgo], 15_000)
+    expect(result).toHaveLength(2)
+    expect(result).not.toContain(twentySecondsAgo)
+  })
+
+  it("returns all runs when they all fall within the window", () => {
+    const runs = [
+      makeRun({ createdAt: "2024-01-01T00:01:00Z" }),
+      makeRun({ createdAt: "2024-01-01T00:01:01Z" }),
+      makeRun({ createdAt: "2024-01-01T00:01:02Z" }),
+    ]
+    expect(groupRunsByTrigger(runs)).toHaveLength(3)
   })
 })
