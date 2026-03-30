@@ -1,0 +1,140 @@
+import { tool } from "@opencode-ai/plugin"
+import type { Plugin, Hooks, PluginOptions } from "@opencode-ai/plugin"
+import {
+  fetchWorkflowRuns,
+  mapStatus,
+  formatStatus,
+  type WorkflowRun,
+  type GhOptions,
+  type ShellFn,
+} from "./gh.js"
+
+interface PluginConfig {
+  branch?: string
+  limit?: number
+  workflows?: string[]
+  pollInterval?: number
+}
+
+function parseOptions(options?: PluginOptions): PluginConfig {
+  if (!options) return {}
+  return {
+    branch: typeof options.branch === "string" ? options.branch : undefined,
+    limit: typeof options.limit === "number" ? options.limit : undefined,
+    workflows: Array.isArray(options.workflows)
+      ? options.workflows.filter((w): w is string => typeof w === "string")
+      : undefined,
+    pollInterval:
+      typeof options.pollInterval === "number" ? options.pollInterval : undefined,
+  }
+}
+
+export const server: Plugin = async (input, options) => {
+  const config = parseOptions(options)
+  const $ = input.$ as unknown as ShellFn
+
+  const ghOptions: GhOptions = {
+    branch: config.branch,
+    limit: config.limit ?? 5,
+    workflows: config.workflows,
+  }
+
+  let cachedRuns: WorkflowRun[] = []
+  let lastFetch = 0
+  const pollInterval = config.pollInterval ?? 30_000
+
+  async function getRuns(): Promise<WorkflowRun[]> {
+    const now = Date.now()
+    if (now - lastFetch > pollInterval) {
+      cachedRuns = await fetchWorkflowRuns($, ghOptions)
+      lastFetch = now
+    }
+    return cachedRuns
+  }
+
+  // The sidebar hook is supported at runtime but not yet in the published
+  // @opencode-ai/plugin type definitions (see sst/opencode#5971).
+  interface SidebarPanelItem {
+    label: string
+    value?: string
+    status?: "success" | "warning" | "error" | "info"
+  }
+
+  interface SidebarPanel {
+    id: string
+    title: string
+    items: SidebarPanelItem[] | (() => Promise<SidebarPanelItem[]>)
+  }
+
+  interface HooksWithSidebar extends Hooks {
+    sidebar?: SidebarPanel[]
+  }
+
+  const hooks: HooksWithSidebar = {
+    sidebar: [
+      {
+        id: "gh-actions",
+        title: "GitHub Actions",
+        items: async () => {
+          const runs = await getRuns()
+          if (runs.length === 0) {
+            return [{ label: "No workflow runs found" }]
+          }
+          return runs.map((run) => ({
+            label: run.name,
+            value: formatStatus(run),
+            status: mapStatus(run),
+          }))
+        },
+      },
+    ],
+
+    tool: {
+      gh_actions: tool({
+        description:
+          "Check GitHub Actions workflow run statuses for the current branch. " +
+          "Returns the latest workflow runs with their name, status, conclusion, and URL.",
+        args: {
+          branch: tool.schema
+            .string()
+            .optional()
+            .describe(
+              'Branch to check. Defaults to the current git branch. Use "current" for the current branch.',
+            ),
+          limit: tool.schema
+            .number()
+            .optional()
+            .describe("Maximum number of runs to return (default: 5)"),
+        },
+        async execute(args) {
+          const runs = await fetchWorkflowRuns($, {
+            branch: args.branch ?? ghOptions.branch,
+            limit: args.limit ?? ghOptions.limit,
+            workflows: ghOptions.workflows,
+          })
+
+          if (runs.length === 0) {
+            return "No workflow runs found for the current branch."
+          }
+
+          const lines = runs.map((run) => {
+            const status = formatStatus(run)
+            const icon =
+              mapStatus(run) === "success"
+                ? "✓"
+                : mapStatus(run) === "error"
+                  ? "✗"
+                  : mapStatus(run) === "warning"
+                    ? "⚠"
+                    : "●"
+            return `${icon} ${run.name}: ${status} (${run.displayTitle})\n  ${run.url}`
+          })
+
+          return lines.join("\n\n")
+        },
+      }),
+    },
+  }
+
+  return hooks
+}
