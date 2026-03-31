@@ -1,5 +1,7 @@
 import { tool } from "@opencode-ai/plugin"
 import type { Plugin, Hooks, PluginOptions } from "@opencode-ai/plugin"
+import { resolve, dirname } from "node:path"
+import { fileURLToPath } from "node:url"
 import {
   checkGhAvailable,
   fetchWorkflowRuns,
@@ -56,6 +58,23 @@ export function parseOptions(options?: PluginOptions): PluginConfig {
       : undefined,
   }
 }
+
+/**
+ * Resolve the path to the bundled skills directory shipped with this plugin.
+ * Works both in source (src/) and compiled (dist/) layouts.
+ */
+function getSkillsDir(): string {
+  // import.meta.url points to the current file; skills/ lives at the package root.
+  const thisDir = dirname(fileURLToPath(import.meta.url))
+  // From src/ or dist/, go up one level to the package root.
+  return resolve(thisDir, "..", "skills")
+}
+
+const SKILLS_SYSTEM_PROMPT =
+  "The gh-actions-status plugin provides a `gh_actions` tool. " +
+  "Use it to check GitHub Actions workflow run statuses and unresolved PR review comments " +
+  "for the current branch. Call it after pushing code, when CI toast notifications appear, " +
+  "when asked about CI status, or before creating a pull request."
 
 export const server: Plugin = async (input, options) => {
   const config = parseOptions(options)
@@ -401,16 +420,47 @@ export const server: Plugin = async (input, options) => {
     sidebar?: SidebarPanel[]
   }
 
+  const skillsDir = getSkillsDir()
+
   // Start the background watcher immediately on plugin init so that pushes
   // made outside of OpenCode (no session.idle) are still detected.
   startWatcher()
 
   const hooks: HooksWithSidebar = {
+    config: async (config) => {
+      // Register the bundled skills directory so OpenCode discovers the SKILL.md.
+      // The skills property exists at runtime (SDK v2) but may be absent from the
+      // type definitions shipped with the current @opencode-ai/plugin version.
+      const cfg = config as typeof config & { skills?: { paths?: string[]; urls?: string[] } }
+      if (!cfg.skills) cfg.skills = {}
+      if (!cfg.skills.paths) cfg.skills.paths = []
+      if (!cfg.skills.paths.includes(skillsDir)) {
+        cfg.skills.paths.push(skillsDir)
+      }
+    },
+
     event: async ({ event }) => {
       if (event.type === "session.idle") {
         // After an agent turn, skip the watcher delay and poll immediately.
         startPolling()
       }
+    },
+
+    // Inject skill awareness into the system prompt on every LLM call so the
+    // agent always knows the gh_actions tool is available — even after context
+    // compaction discards earlier messages.
+    "experimental.chat.system.transform": async (_input, output) => {
+      if (!output.system.includes(SKILLS_SYSTEM_PROMPT)) {
+        output.system.push(SKILLS_SYSTEM_PROMPT)
+      }
+    },
+
+    // Ensure the compaction summary preserves awareness of the gh_actions skill.
+    "experimental.session.compacting": async (_input, output) => {
+      output.context.push(
+        "The gh-actions-status plugin is active. The agent has access to a `gh_actions` tool " +
+          "for checking GitHub Actions workflow statuses and unresolved PR review comments.",
+      )
     },
 
     sidebar: [

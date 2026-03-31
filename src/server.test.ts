@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
+import { resolve, dirname } from "node:path"
+import { fileURLToPath } from "node:url"
 import { _exec } from "./gh.js"
 import { parseOptions, server } from "./server.js"
 import type { WorkflowRun } from "./gh.js"
@@ -594,5 +596,98 @@ describe("server — gh_actions tool", () => {
     const body = lastToastBody(showToast)
     expect(body.message).toContain("1 passing")
     expect(body.message).toContain("2 unresolved")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// server — skill installation hooks
+// ---------------------------------------------------------------------------
+
+describe("server — config hook registers skills directory", () => {
+  it("adds the skills directory to config.skills.paths", async () => {
+    const runs = [makeRun({ conclusion: "success" })]
+    const { input } = makeInput(runs)
+    const hooks = await server(input)
+
+    const config = {} as Record<string, unknown>
+    await hooks.config!(config as never)
+
+    const cfg = config as { skills?: { paths?: string[] } }
+    expect(cfg.skills).toBeDefined()
+    expect(cfg.skills!.paths).toBeDefined()
+    expect(cfg.skills!.paths!.length).toBe(1)
+    // The path should end with /skills and be absolute
+    expect(cfg.skills!.paths![0]).toMatch(/\/skills$/)
+    expect(cfg.skills!.paths![0]).toMatch(/^\//)
+  })
+
+  it("does not duplicate skills path on repeated calls", async () => {
+    const runs = [makeRun({ conclusion: "success" })]
+    const { input } = makeInput(runs)
+    const hooks = await server(input)
+
+    const config = {} as Record<string, unknown>
+    await hooks.config!(config as never)
+    await hooks.config!(config as never)
+
+    const cfg = config as { skills?: { paths?: string[] } }
+    expect(cfg.skills!.paths!.length).toBe(1)
+  })
+
+  it("preserves existing skills paths", async () => {
+    const runs = [makeRun({ conclusion: "success" })]
+    const { input } = makeInput(runs)
+    const hooks = await server(input)
+
+    const config = { skills: { paths: ["/existing/skills"] } } as Record<string, unknown>
+    await hooks.config!(config as never)
+
+    const cfg = config as { skills: { paths: string[] } }
+    expect(cfg.skills.paths.length).toBe(2)
+    expect(cfg.skills.paths[0]).toBe("/existing/skills")
+  })
+})
+
+describe("server — system transform hook", () => {
+  it("injects skill awareness into the system prompt", async () => {
+    const runs = [makeRun({ conclusion: "success" })]
+    const { input } = makeInput(runs)
+    const hooks = await server(input)
+
+    const transform = hooks["experimental.chat.system.transform"]!
+    const output = { system: [] as string[] }
+    await transform({ model: {} } as never, output)
+
+    expect(output.system.length).toBe(1)
+    expect(output.system[0]).toContain("gh_actions")
+  })
+
+  it("does not duplicate the prompt on repeated calls", async () => {
+    const runs = [makeRun({ conclusion: "success" })]
+    const { input } = makeInput(runs)
+    const hooks = await server(input)
+
+    const transform = hooks["experimental.chat.system.transform"]!
+    const output = { system: [] as string[] }
+    await transform({ model: {} } as never, output)
+    await transform({ model: {} } as never, output)
+
+    expect(output.system.length).toBe(1)
+  })
+})
+
+describe("server — session compacting hook", () => {
+  it("adds skill context to the compaction prompt", async () => {
+    const runs = [makeRun({ conclusion: "success" })]
+    const { input } = makeInput(runs)
+    const hooks = await server(input)
+
+    const compacting = hooks["experimental.session.compacting"]!
+    const output = { context: [] as string[] }
+    await compacting({ sessionID: "s1" }, output)
+
+    expect(output.context.length).toBe(1)
+    expect(output.context[0]).toContain("gh-actions-status")
+    expect(output.context[0]).toContain("gh_actions")
   })
 })
