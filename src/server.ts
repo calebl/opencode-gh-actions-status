@@ -67,17 +67,12 @@ export const server: Plugin = async (input, options) => {
     const ghCheck = await checkGhAvailable(cwd)
     if (ghCheck !== true) {
       const client = input.client
-      // Show a persistent error toast
+      // Show a persistent error toast — sidebar is not a supported API so we
+      // rely solely on the toast to surface the error to the user.
       void (client.tui as unknown as { showToast: (args: { body: { title: string; message: string; variant: string; duration: number } }) => Promise<void> })
         .showToast({ body: { title: "GitHub Actions", message: ghCheck, variant: "error", duration: 30 * 60 * 1000 } })
-      // Return a no-op plugin with a sidebar error
-      return {
-        sidebar: [{
-          id: "gh-actions-status",
-          title: "GitHub Actions",
-          items: [{ label: "gh CLI not found", status: "error" as const }],
-        }],
-      } as unknown as ReturnType<Plugin>
+      // Return an empty no-op hooks object
+      return {} as ReturnType<Plugin>
     }
   }
 

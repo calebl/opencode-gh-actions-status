@@ -171,10 +171,8 @@ describe("server — gh not available", () => {
     expect(body.variant).toBe("error")
     expect(body.message).toContain("gh")
 
-    // Sidebar should show an error item
-    const sidebar = (hooks as unknown as { sidebar: Array<{ items: Array<{ label: string; status: string }> }> }).sidebar
-    expect(sidebar[0].items[0].status).toBe("error")
-    expect(sidebar[0].items[0].label).toContain("gh")
+    // Should return an empty hooks object (no timers, no polling)
+    expect(hooks).toEqual({})
   })
 })
 
