@@ -5,13 +5,15 @@ import { fileURLToPath } from "node:url"
 import {
   checkGhAvailable,
   fetchWorkflowRuns,
-  fetchUnresolvedThreads,
+  fetchUnresolvedThreadsWithIds,
+  resolveThread,
   filterRunsByCommit,
   getHeadCommitSha,
   mapStatus,
   formatStatus,
   type WorkflowRun,
   type ReviewThread,
+  type ReviewThreadWithId,
   type GhOptions,
 } from "./gh.js"
 
@@ -74,7 +76,7 @@ function getSkillsDir(): string {
  * Format workflow runs and review threads into a readable report.
  * Shared between the gh_actions tool and the post-push prompt.
  */
-export function formatRunResults(runs: WorkflowRun[], threads: ReviewThread[]): string {
+export function formatRunResults(runs: WorkflowRun[], threads: ReviewThread[] | ReviewThreadWithId[]): string {
   if (runs.length === 0) {
     return "No workflow runs found for the current commit."
   }
@@ -91,11 +93,16 @@ export function formatRunResults(runs: WorkflowRun[], threads: ReviewThread[]): 
 
   if (threads.length > 0) {
     output.push(`\n## Unresolved Review Comments (${threads.length})`)
+    const hasIds = "id" in threads[0]
+    if (hasIds) {
+      output.push("Use the `resolve_comment` tool with the thread ID to mark a thread as resolved.")
+    }
     for (const thread of threads) {
       const location = thread.line
         ? `${thread.path}:${thread.line}`
         : thread.path
-      output.push(`\n### ${location}`)
+      const heading = hasIds ? `\n### ${location} (thread ID: ${"id" in thread ? thread.id : ""})` : `\n### ${location}`
+      output.push(heading)
       for (const comment of thread.comments) {
         output.push(`**${comment.author}** (${comment.createdAt}):\n${comment.body}\n${comment.url}`)
       }
@@ -322,7 +329,7 @@ export const server: Plugin = async (input, options) => {
    * CI results so the agent can act on failures or review comments.
    */
   async function promptSessionWithResults(sessionID: string, commitRuns: WorkflowRun[]) {
-    const threads = mockSnapshots === null ? await fetchUnresolvedThreads(cwd) : []
+    const threads = mockSnapshots === null ? await fetchUnresolvedThreadsWithIds(cwd) : []
     const text = formatRunResults(commitRuns, threads)
     try {
       // The client exposes session.prompt() at runtime (SDK v2) but the
@@ -377,7 +384,7 @@ export const server: Plugin = async (input, options) => {
     trackedRunId = newestId
     const active = isRunActive(commitRuns)
     const unresolvedCount = mockSnapshots === null
-      ? await fetchUnresolvedThreads(cwd).then((t) => t.length)
+      ? await fetchUnresolvedThreadsWithIds(cwd).then((t: ReviewThreadWithId[]) => t.length)
       : 0
     const { variant, summary } = buildToastPayload(commitRuns, unresolvedCount)
     const toastKey = `${variant}:${summary}`
@@ -621,8 +628,40 @@ export const server: Plugin = async (input, options) => {
 
           const headSha = await getHeadCommitSha(cwd)
           const commitRuns = headSha ? filterRunsByCommit(runs, headSha) : runs
-          const threads = await fetchUnresolvedThreads(cwd)
+          const threads = await fetchUnresolvedThreadsWithIds(cwd)
           return formatRunResults(commitRuns, threads)
+        },
+      }),
+
+      resolve_comment: tool({
+        description:
+          "Resolve one or more unresolved PR review threads by their thread ID. " +
+          "Use gh_actions first to list unresolved threads and obtain their IDs, " +
+          "then call this tool with the thread ID(s) to mark them as resolved on GitHub.",
+        args: {
+          threadIds: tool.schema
+            .array(tool.schema.string())
+            .describe(
+              "Array of GraphQL review thread node IDs to resolve. " +
+              "Obtain these by calling gh_actions which returns thread IDs " +
+              "alongside the unresolved comment text.",
+            ),
+        },
+        async execute(args) {
+          if (!args.threadIds || args.threadIds.length === 0) {
+            return "No thread IDs provided. Pass one or more thread node IDs to resolve."
+          }
+
+          const results: string[] = []
+          for (const threadId of args.threadIds) {
+            const outcome = await resolveThread(threadId, cwd)
+            if (outcome === true) {
+              results.push(`✓ Resolved thread ${threadId}`)
+            } else {
+              results.push(`✗ Failed to resolve thread ${threadId}: ${outcome}`)
+            }
+          }
+          return results.join("\n")
         },
       }),
     },
