@@ -106,6 +106,25 @@ export const server: Plugin = async (input, options) => {
     return cachedRuns
   }
 
+  /**
+   * Lightweight peek used by the watcher: returns the current cache without
+   * advancing the mock index or triggering an extra fetch.
+   * In real mode it returns cached data (possibly stale); tickToast is
+   * responsible for doing a fresh fetch when it actually runs.
+   */
+  async function peekRuns(): Promise<WorkflowRun[]> {
+    if (mockSnapshots !== null) {
+      // In mock mode return the current snapshot without advancing the index
+      return mockSnapshots[Math.min(mockIndex, mockSnapshots.length - 1)]
+    }
+    // Return the current cache. If empty, do a single fetch to prime it so
+    // the watcher can detect whether any runs exist on startup.
+    if (cachedRuns.length === 0 && lastFetch === 0) {
+      return getRuns()
+    }
+    return cachedRuns
+  }
+
   const client = input.client
 
   // ── Toast lifecycle state ──────────────────────────────────────────────────
@@ -129,8 +148,11 @@ export const server: Plugin = async (input, options) => {
   let trackedRunId: number | null = null
   // Key of the last toast we sent (variant:summary) – used to skip no-op updates
   let lastToastKey = ""
-  // setInterval handle for the active polling loop
+  // setInterval handle for the active polling loop (fast, 10 s)
   let pollHandle: unknown = null
+  // setInterval handle for the background watcher (slow, 30 s)
+  // Watches for new runs that appear from pushes made outside of OpenCode.
+  let watchHandle: unknown = null
 
   function isRunActive(runs: WorkflowRun[]): boolean {
     return runs.some(
@@ -266,6 +288,48 @@ export const server: Plugin = async (input, options) => {
     pollHandle = _setInterval(() => void tickToast(), 10_000)
   }
 
+  /**
+   * Background watcher: runs on a slow interval (pollInterval, default 30 s)
+   * from plugin init. Checks whether a run exists for the current HEAD commit
+   * and kicks off the fast poll loop if so. This lets the plugin detect CI runs
+   * triggered by pushes made outside of OpenCode (where no session.idle fires).
+   */
+  async function watchTick() {
+    // If the fast poll loop is already running, nothing to do
+    if (pollHandle !== null) return
+
+    let runs: WorkflowRun[]
+    try {
+      runs = await peekRuns()
+    } catch {
+      return
+    }
+
+    if (runs.length === 0) return
+
+    // Check if there are any runs for the current HEAD commit
+    let commitRuns = runs
+    if (mockSnapshots === null) {
+      const headSha = await getHeadCommitSha($)
+      if (!headSha || filterRunsByCommit(runs, headSha).length === 0) return
+      commitRuns = filterRunsByCommit(runs, headSha)
+    }
+
+    // If we already reported a final result for this run, don't re-trigger
+    const newestId = commitRuns[0].databaseId
+    if (newestId === trackedRunId && lastToastKey !== "") return
+
+    // A new or active run exists for HEAD — hand off to the fast poll loop
+    startPolling()
+  }
+
+  function startWatcher() {
+    if (watchHandle !== null) return // already running
+    // Fire once immediately, then repeat on the poll interval
+    void watchTick()
+    watchHandle = _setInterval(() => void watchTick(), pollInterval)
+  }
+
   // The sidebar hook is supported at runtime but not yet in the published
   // @opencode-ai/plugin type definitions (see sst/opencode#5971).
   interface SidebarPanelItem {
@@ -284,11 +348,14 @@ export const server: Plugin = async (input, options) => {
     sidebar?: SidebarPanel[]
   }
 
+  // Start the background watcher immediately on plugin init so that pushes
+  // made outside of OpenCode (no session.idle) are still detected.
+  startWatcher()
+
   const hooks: HooksWithSidebar = {
     event: async ({ event }) => {
       if (event.type === "session.idle") {
-        // Start polling for runs whenever the session goes idle (i.e. after
-        // the agent finishes a turn and might have triggered a CI run).
+        // After an agent turn, skip the watcher delay and poll immediately.
         startPolling()
       }
     },
