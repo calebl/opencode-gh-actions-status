@@ -4,11 +4,13 @@ An [OpenCode](https://opencode.ai) plugin that surfaces GitHub Actions workflow 
 
 ## Features
 
-- **Instant push detection**: Shows a "Waiting for CI..." toast the moment you push to a branch — before GitHub has even queued the run
+- **Instant push detection**: Shows a "Waiting for CI..." toast the moment you push — before GitHub has even queued the run
 - **Live status updates**: Transitions through `Waiting for CI...` → `1 running` → `1 passing` (or `1 failing`) as the run progresses
+- **Post-push agent prompt**: When the agent runs `git push` and CI completes, the plugin automatically prompts the agent with the full run results and any unresolved review comments so it can react autonomously — fixing failures or addressing feedback without being asked
 - **Unresolved comment count**: Toast includes a count of unresolved PR review threads so you always know if there is feedback waiting
 - **Sidebar panel**: Color-coded list of the latest workflow runs for your current branch
-- **Agent tool**: The AI agent can call `gh_actions` to check CI status and read the full text of unresolved review comments, enabling it to proactively address reviewer feedback
+- **Agent tool**: The AI agent can call `gh_actions` to check CI status and read the full text of unresolved review comments
+- **Skill file**: Bundled `SKILL.md` is auto-registered via the `config` hook, with system prompt injection and compaction-safe context so the agent never loses awareness of the tool in long sessions
 
 ## Requirements
 
@@ -59,6 +61,7 @@ The plugin runs a background watcher on `watchInterval` (default 5s) that:
 2. Polls `gh run list` for runs matching the current HEAD commit SHA
 3. Once a run appears, starts a fast 10s poll loop that updates the toast through each state transition
 4. On completion, shows the final result with a 30-minute toast duration
+5. If the push was initiated by the agent (detected via the `tool.execute.after` hook), prompts the agent session with the full CI report so it can autonomously react to failures or review comments
 
 The toast message format:
 
@@ -84,6 +87,20 @@ When the AI agent calls `gh_actions`, it receives:
 - Full text of all unresolved PR review threads (file path, line number, author, comment body, and URL)
 
 This allows the agent to proactively check CI results and address code review feedback without you having to ask.
+
+## Skill & context persistence
+
+The plugin ships a `skills/gh-actions/SKILL.md` file that describes when and how to use the `gh_actions` tool. It is installed automatically via three hooks:
+
+| Hook | Purpose |
+|------|---------|
+| `config` | Registers the `skills/` directory so OpenCode discovers the skill on startup |
+| `experimental.chat.system.transform` | Injects a short reminder about the tool into the system prompt on every LLM call, surviving context compaction |
+| `experimental.session.compacting` | Adds context to the compaction summary so the agent retains awareness of the tool after long sessions |
+
+## Post-push CI prompt
+
+When the agent runs `git push` (detected via `tool.execute.after`), the plugin tracks the session ID. Once all workflow runs reach a final state, it calls `session.prompt()` to inject the full CI report — including unresolved review comments — as a synthetic message. This triggers an agent turn so it can autonomously fix CI failures or address reviewer feedback.
 
 ## Development
 
