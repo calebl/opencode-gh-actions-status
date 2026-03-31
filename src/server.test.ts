@@ -203,7 +203,7 @@ describe("server — toast on session.idle", () => {
     await fireIdle(hooks)
     await vi.runOnlyPendingTimersAsync()
 
-    expect(lastToastBody(showToast).duration).toBe(10_500)
+    expect(lastToastBody(showToast).duration).toBe(30_000)
   })
 
   it("shows an error toast when a run is failing", async () => {
@@ -408,7 +408,7 @@ describe("server — mockRuns mode", () => {
 
     expect(showToast).toHaveBeenCalledTimes(1)
     expect(showToast.mock.calls[0][0].body.variant).toBe("info")
-    expect(showToast.mock.calls[0][0].body.duration).toBe(10_500)
+    expect(showToast.mock.calls[0][0].body.duration).toBe(30_000)
     expect(execSpy).not.toHaveBeenCalled()
   })
 

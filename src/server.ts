@@ -281,7 +281,7 @@ export const server: Plugin = async (input, options) => {
 
     if (toastKey !== lastToastKey) {
       const duration = active
-        ? 10_500 // slightly longer than the poll interval so it stays visible
+        ? 30_000 // 30 s minimum so toast stays visible between state changes
         : 30 * 60 * 1000 // 30 minutes for a final state
       await sendToast(variant, summary, duration)
       lastToastKey = toastKey
@@ -324,7 +324,7 @@ export const server: Plugin = async (input, options) => {
         lastToastKey = ""
         const waitingKey = "info:waiting"
         if (lastToastKey !== waitingKey) {
-          await sendToast("info", "Waiting for CI...", 10_500)
+          await sendToast("info", "Waiting for CI...", 30_000)
           lastToastKey = waitingKey
         }
       }
