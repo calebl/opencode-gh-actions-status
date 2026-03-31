@@ -21,8 +21,10 @@ export interface PluginConfig {
   branch?: string
   limit?: number
   workflows?: string[]
+  /** Cache TTL (ms) for workflow run results returned by the sidebar. Default: 60 000 */
   pollInterval?: number
-  watchInterval?: number
+  /** How often (ms) the toast-poll loop fires while CI runs are active after a push. Default: 30 000 */
+  toastInterval?: number
   /**
    * When set, the plugin returns these runs instead of calling `gh`.
    * Each element is a snapshot; the plugin cycles through them on each poll
@@ -53,8 +55,8 @@ export function parseOptions(options?: PluginOptions): PluginConfig {
       : undefined,
     pollInterval:
       typeof options.pollInterval === "number" ? options.pollInterval : undefined,
-    watchInterval:
-      typeof options.watchInterval === "number" ? options.watchInterval : undefined,
+    toastInterval:
+      typeof options.toastInterval === "number" ? options.toastInterval : undefined,
     mockRuns: Array.isArray(options.mockRuns)
       ? (options.mockRuns as WorkflowRun[][]).filter(Array.isArray)
       : undefined,
@@ -150,9 +152,9 @@ export const server: Plugin = async (input, options) => {
 
   let cachedRuns: WorkflowRun[] = []
   let lastFetch = 0
-  const pollInterval = config.pollInterval ?? 30_000
-  // How often the background watcher checks for new runs (independent of cache TTL)
-  const watchInterval = config.watchInterval ?? 5_000
+  const pollInterval = config.pollInterval ?? 60_000
+  // How often the toast-poll loop fires while CI runs are active after a push
+  const toastInterval = config.toastInterval ?? 30_000
   let fetchPromise: Promise<WorkflowRun[]> | null = null
   let lastFetchError: string | null = null
 
@@ -193,21 +195,6 @@ export const server: Plugin = async (input, options) => {
     return cachedRuns
   }
 
-  /**
-   * Lightweight peek used by the watcher: returns runs without advancing the
-   * mock index. In real mode it always fetches fresh data (bypassing the cache)
-   * so the watcher can detect new runs as soon as they appear on GitHub, without
-   * waiting for the pollInterval cache TTL to expire.
-   */
-  async function peekRuns(): Promise<WorkflowRun[]> {
-    if (mockSnapshots !== null) {
-      // In mock mode return the current snapshot without advancing the index
-      return mockSnapshots[Math.min(mockIndex, mockSnapshots.length - 1)]
-    }
-    // Bypass the cache so each watcher tick gets fresh data
-    return fetchWorkflowRuns(ghOptions)
-  }
-
   const client = input.client
 
   // ── Toast lifecycle state ──────────────────────────────────────────────────
@@ -231,13 +218,8 @@ export const server: Plugin = async (input, options) => {
   let trackedRunId: number | null = null
   // Key of the last toast we sent (variant:summary) – used to skip no-op updates
   let lastToastKey = ""
-  // setInterval handle for the active polling loop (fast, 10 s)
+  // setInterval handle for the active polling loop
   let pollHandle: unknown = null
-  // setInterval handle for the background watcher (slow, 5 s)
-  // Watches for new runs that appear from pushes made outside of OpenCode.
-  let watchHandle: unknown = null
-  // Last HEAD SHA seen by the watcher — used to detect new pushes immediately
-  let lastSeenSha = ""
   // Session IDs that triggered a git push — when non-empty, the plugin will
   // prompt each session with CI results once runs reach a final state.
   // Using a Set so multiple rapid pushes from different sessions are all tracked
@@ -415,78 +397,9 @@ export const server: Plugin = async (input, options) => {
 
   function startPolling() {
     if (pollHandle !== null) return // already running
-    // Fire immediately, then repeat every 10 s
+    // Fire immediately, then repeat on the configured toast interval (default 30 s)
     void tickToast()
-    pollHandle = _setInterval(() => void tickToast(), 10_000)
-  }
-
-  /**
-   * Background watcher: runs on watchInterval (default 5 s) from plugin init.
-   *
-   * Two responsibilities:
-   * 1. Detect a new push immediately (HEAD SHA changed) and show a
-   *    "Waiting for CI..." toast before GitHub has even queued the run.
-   * 2. Once the run appears in gh run list, hand off to the fast poll loop.
-   */
-  async function watchTick() {
-    // If the fast poll loop is already running, nothing to do
-    if (pollHandle !== null) return
-
-    if (mockSnapshots === null) {
-      const headSha = await getHeadCommitSha(cwd)
-      if (!headSha) return
-
-      // New push detected — show a pending toast immediately
-      if (headSha !== lastSeenSha) {
-        lastSeenSha = headSha
-        // Reset tracking so we don't suppress the upcoming run's toast
-        trackedRunId = null
-        lastToastKey = ""
-        // Guard against re-sending "Waiting for CI..." on subsequent watcher
-        // ticks for the same SHA (lastToastKey was just cleared above, so a
-        // direct equality check here is correct — we only enter this block once
-        // per SHA change).
-        await sendToast("info", "Waiting for CI...", 30_000)
-        lastToastKey = "info:waiting"
-      }
-
-      // Check if a run has appeared for this HEAD commit
-      let runs: WorkflowRun[]
-      try {
-        runs = await peekRuns()
-      } catch {
-        return
-      }
-
-      const commitRuns = filterRunsByCommit(runs, headSha)
-      if (commitRuns.length === 0) return
-
-      // If we already reported a final result for this run, don't re-trigger
-      const newestId = commitRuns[0].databaseId
-      if (newestId === trackedRunId && lastToastKey !== "" && lastToastKey !== "info:waiting") return
-
-      // Run has appeared — hand off to the fast poll loop
-      startPolling()
-    } else {
-      // Mock mode: no SHA tracking, just check for runs
-      let runs: WorkflowRun[]
-      try {
-        runs = await peekRuns()
-      } catch {
-        return
-      }
-      if (runs.length === 0) return
-      const newestId = runs[0].databaseId
-      if (newestId === trackedRunId && lastToastKey !== "") return
-      startPolling()
-    }
-  }
-
-  function startWatcher() {
-    if (watchHandle !== null) return // already running
-    // Fire once immediately, then repeat on the watch interval
-    void watchTick()
-    watchHandle = _setInterval(() => void watchTick(), watchInterval)
+    pollHandle = _setInterval(() => void tickToast(), toastInterval)
   }
 
   // The sidebar hook is supported at runtime but not yet in the published
@@ -509,10 +422,6 @@ export const server: Plugin = async (input, options) => {
 
   const skillsDir = getSkillsDir()
 
-  // Start the background watcher immediately on plugin init so that pushes
-  // made outside of OpenCode (no session.idle) are still detected.
-  startWatcher()
-
   const hooks: HooksWithSidebar = {
     config: async (config) => {
       // Register the bundled skills directory so OpenCode discovers the SKILL.md.
@@ -523,13 +432,6 @@ export const server: Plugin = async (input, options) => {
       if (!cfg.skills.paths) cfg.skills.paths = []
       if (!cfg.skills.paths.includes(skillsDir)) {
         cfg.skills.paths.push(skillsDir)
-      }
-    },
-
-    event: async ({ event }) => {
-      if (event.type === "session.idle") {
-        // After an agent turn, skip the watcher delay and poll immediately.
-        startPolling()
       }
     },
 
@@ -552,22 +454,26 @@ export const server: Plugin = async (input, options) => {
       }
     },
 
-    // Detect agent-initiated git push commands so we can automatically prompt
-    // the session with CI results once all runs reach a final state.
+    // Detect agent-initiated git push commands. On push:
+    //  1. Show an immediate "Waiting for CI..." toast
+    //  2. Reset tracking so the next run is treated as fresh
+    //  3. Start polling — stops automatically when the run reaches a final state
     "tool.execute.after": async (input, _output) => {
       const args = typeof input.args === "string"
         ? input.args
         : JSON.stringify(input.args ?? "")
       if (/\bgit\s+push\b/.test(args)) {
-        // If CI has already finished by the time this hook fires (race condition:
-        // fast CI or a delayed hook invocation), prompt the session immediately
-        // using the stashed completed runs rather than waiting for a future tick
-        // that will never come.
-        if (pollHandle === null && lastCompletedRuns.length > 0) {
-          void promptSessionWithResults(input.sessionID, lastCompletedRuns)
-        } else {
-          pendingPushSessionIDs.add(input.sessionID)
+        pendingPushSessionIDs.add(input.sessionID)
+        // Reset tracking so the upcoming run's toast is not suppressed
+        trackedRunId = null
+        lastToastKey = ""
+        lastCompletedRuns = []
+        // Show an immediate placeholder toast while GitHub queues the run
+        if (mockSnapshots === null) {
+          void sendToast("info", "Waiting for CI...", 30_000)
+          lastToastKey = "info:waiting"
         }
+        startPolling()
       }
     },
 
