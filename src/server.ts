@@ -151,9 +151,11 @@ export const server: Plugin = async (input, options) => {
   let lastToastKey = ""
   // setInterval handle for the active polling loop (fast, 10 s)
   let pollHandle: unknown = null
-  // setInterval handle for the background watcher (slow, 30 s)
+  // setInterval handle for the background watcher (slow, 5 s)
   // Watches for new runs that appear from pushes made outside of OpenCode.
   let watchHandle: unknown = null
+  // Last HEAD SHA seen by the watcher — used to detect new pushes immediately
+  let lastSeenSha = ""
 
   function isRunActive(runs: WorkflowRun[]): boolean {
     return runs.some(
@@ -290,38 +292,64 @@ export const server: Plugin = async (input, options) => {
   }
 
   /**
-   * Background watcher: runs on a slow interval (pollInterval, default 30 s)
-   * from plugin init. Checks whether a run exists for the current HEAD commit
-   * and kicks off the fast poll loop if so. This lets the plugin detect CI runs
-   * triggered by pushes made outside of OpenCode (where no session.idle fires).
+   * Background watcher: runs on watchInterval (default 5 s) from plugin init.
+   *
+   * Two responsibilities:
+   * 1. Detect a new push immediately (HEAD SHA changed) and show a
+   *    "Waiting for CI..." toast before GitHub has even queued the run.
+   * 2. Once the run appears in gh run list, hand off to the fast poll loop.
    */
   async function watchTick() {
     // If the fast poll loop is already running, nothing to do
     if (pollHandle !== null) return
 
-    let runs: WorkflowRun[]
-    try {
-      runs = await peekRuns()
-    } catch {
-      return
-    }
-
-    if (runs.length === 0) return
-
-    // Check if there are any runs for the current HEAD commit
-    let commitRuns = runs
     if (mockSnapshots === null) {
       const headSha = await getHeadCommitSha(cwd)
-      if (!headSha || filterRunsByCommit(runs, headSha).length === 0) return
-      commitRuns = filterRunsByCommit(runs, headSha)
+      if (!headSha) return
+
+      // New push detected — show a pending toast immediately
+      if (headSha !== lastSeenSha) {
+        lastSeenSha = headSha
+        // Reset tracking so we don't suppress the upcoming run's toast
+        trackedRunId = null
+        lastToastKey = ""
+        const waitingKey = "info:waiting"
+        if (lastToastKey !== waitingKey) {
+          await sendToast("info", "Waiting for CI...", 10_500)
+          lastToastKey = waitingKey
+        }
+      }
+
+      // Check if a run has appeared for this HEAD commit
+      let runs: WorkflowRun[]
+      try {
+        runs = await peekRuns()
+      } catch {
+        return
+      }
+
+      const commitRuns = filterRunsByCommit(runs, headSha)
+      if (commitRuns.length === 0) return
+
+      // If we already reported a final result for this run, don't re-trigger
+      const newestId = commitRuns[0].databaseId
+      if (newestId === trackedRunId && lastToastKey !== "" && lastToastKey !== "info:waiting") return
+
+      // Run has appeared — hand off to the fast poll loop
+      startPolling()
+    } else {
+      // Mock mode: no SHA tracking, just check for runs
+      let runs: WorkflowRun[]
+      try {
+        runs = await peekRuns()
+      } catch {
+        return
+      }
+      if (runs.length === 0) return
+      const newestId = runs[0].databaseId
+      if (newestId === trackedRunId && lastToastKey !== "") return
+      startPolling()
     }
-
-    // If we already reported a final result for this run, don't re-trigger
-    const newestId = commitRuns[0].databaseId
-    if (newestId === trackedRunId && lastToastKey !== "") return
-
-    // A new or active run exists for HEAD — hand off to the fast poll loop
-    startPolling()
   }
 
   function startWatcher() {
