@@ -297,12 +297,11 @@ describe("server — toast on session.idle", () => {
     const secondRun = makeRun({ databaseId: 200, conclusion: "failure" })
 
     const showToast = vi.fn().mockResolvedValue(undefined)
-    let ghCallCount = 0
+    let serveSecondRun = false
     execSpy.mockImplementation((cmd: string[]) => {
       if (cmd.includes("branch")) return Promise.resolve("main\n")
       if (cmd.includes("rev-parse")) return Promise.resolve(TEST_HEAD_SHA + "\n")
-      ghCallCount++
-      return Promise.resolve(JSON.stringify(ghCallCount <= 2 ? [firstRun] : [secondRun]))
+      return Promise.resolve(JSON.stringify(serveSecondRun ? [secondRun] : [firstRun]))
     })
 
     const input = {
@@ -320,6 +319,8 @@ describe("server — toast on session.idle", () => {
     expect(showToast).toHaveBeenCalledTimes(1)
     expect(showToast.mock.calls[0][0].body.variant).toBe("success")
 
+    // Switch to secondRun before the next idle triggers a fresh fetch
+    serveSecondRun = true
     await fireIdle(hooks)
     await vi.runOnlyPendingTimersAsync()
     expect(showToast).toHaveBeenCalledTimes(3)

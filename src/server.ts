@@ -113,15 +113,17 @@ export const server: Plugin = async (input, options) => {
 
   /**
    * Lightweight peek used by the watcher: returns runs without advancing the
-   * mock index. In real mode it delegates to getRuns() which respects the
-   * pollInterval cache TTL, so at most one gh call per pollInterval window.
+   * mock index. In real mode it always fetches fresh data (bypassing the cache)
+   * so the watcher can detect new runs as soon as they appear on GitHub, without
+   * waiting for the pollInterval cache TTL to expire.
    */
   async function peekRuns(): Promise<WorkflowRun[]> {
     if (mockSnapshots !== null) {
       // In mock mode return the current snapshot without advancing the index
       return mockSnapshots[Math.min(mockIndex, mockSnapshots.length - 1)]
     }
-    return getRuns()
+    // Bypass the cache so each watcher tick gets fresh data
+    return fetchWorkflowRuns(ghOptions)
   }
 
   const client = input.client
