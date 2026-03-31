@@ -1,6 +1,6 @@
 {
   "name": "opencode-gh-actions-status",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenCode plugin that surfaces GitHub Actions workflow run statuses in the sidebar",
   "type": "module",
   "license": "MIT",
@@ -26,7 +26,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "skills"
   ],
   "scripts": {
     "build": "bun tsc",

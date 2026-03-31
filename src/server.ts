@@ -1,5 +1,7 @@
 import { tool } from "@opencode-ai/plugin"
 import type { Plugin, Hooks, PluginOptions } from "@opencode-ai/plugin"
+import { resolve, dirname } from "node:path"
+import { fileURLToPath } from "node:url"
 import {
   checkGhAvailable,
   fetchWorkflowRuns,
@@ -56,6 +58,62 @@ export function parseOptions(options?: PluginOptions): PluginConfig {
       : undefined,
   }
 }
+
+/**
+ * Resolve the path to the bundled skills directory shipped with this plugin.
+ * Works both in source (src/) and compiled (dist/) layouts.
+ */
+function getSkillsDir(): string {
+  // import.meta.url points to the current file; skills/ lives at the package root.
+  const thisDir = dirname(fileURLToPath(import.meta.url))
+  // From src/ or dist/, go up one level to the package root.
+  return resolve(thisDir, "..", "skills")
+}
+
+/**
+ * Format workflow runs and review threads into a readable report.
+ * Shared between the gh_actions tool and the post-push prompt.
+ */
+export function formatRunResults(runs: WorkflowRun[], threads: ReviewThread[]): string {
+  if (runs.length === 0) {
+    return "No workflow runs found for the current commit."
+  }
+
+  const lines = runs.map((run) => {
+    const status = formatStatus(run)
+    const level = mapStatus(run)
+    const icon =
+      level === "success" ? "✓" : level === "error" ? "✗" : level === "warning" ? "⚠" : "●"
+    return `${icon} ${run.name}: ${status} (${run.displayTitle})\n  ${run.url}`
+  })
+
+  const output: string[] = ["## Workflow Runs", lines.join("\n\n")]
+
+  if (threads.length > 0) {
+    output.push(`\n## Unresolved Review Comments (${threads.length})`)
+    for (const thread of threads) {
+      const location = thread.line
+        ? `${thread.path}:${thread.line}`
+        : thread.path
+      output.push(`\n### ${location}`)
+      for (const comment of thread.comments) {
+        output.push(`**${comment.author}** (${comment.createdAt}):\n${comment.body}\n${comment.url}`)
+      }
+    }
+  }
+
+  return output.join("\n")
+}
+
+// Short reminder injected into every system prompt via experimental.chat.system.transform.
+// This is intentionally brief — the full usage guidance lives in skills/gh-actions/SKILL.md
+// which OpenCode loads when needed. The purpose here is only to ensure the agent never
+// loses awareness of the tool after context compaction discards earlier messages.
+const SKILLS_SYSTEM_PROMPT =
+  "The gh-actions-status plugin provides a `gh_actions` tool. " +
+  "Use it to check GitHub Actions workflow run statuses and unresolved PR review comments " +
+  "for the current branch. Call it after pushing code, when asked about CI status, " +
+  "or before creating a pull request."
 
 export const server: Plugin = async (input, options) => {
   const config = parseOptions(options)
@@ -173,6 +231,14 @@ export const server: Plugin = async (input, options) => {
   let watchHandle: unknown = null
   // Last HEAD SHA seen by the watcher — used to detect new pushes immediately
   let lastSeenSha = ""
+  // Session IDs that triggered a git push — when non-empty, the plugin will
+  // prompt each session with CI results once runs reach a final state.
+  // Using a Set so multiple rapid pushes from different sessions are all tracked
+  // and never silently overwrite each other.
+  const pendingPushSessionIDs = new Set<string>()
+  // Runs from the last completed poll cycle — used to immediately prompt a
+  // session if CI has already finished by the time tool.execute.after fires.
+  let lastCompletedRuns: WorkflowRun[] = []
 
   function isRunActive(runs: WorkflowRun[]): boolean {
     return runs.some(
@@ -251,6 +317,28 @@ export const server: Plugin = async (input, options) => {
     }
   }
 
+  /**
+   * After a detected git push, prompt the originating session with the final
+   * CI results so the agent can act on failures or review comments.
+   */
+  async function promptSessionWithResults(sessionID: string, commitRuns: WorkflowRun[]) {
+    const threads = mockSnapshots === null ? await fetchUnresolvedThreads(cwd) : []
+    const text = formatRunResults(commitRuns, threads)
+    try {
+      // The client exposes session.prompt() at runtime (SDK v2) but the
+      // published @opencode-ai/plugin types may not surface it yet.
+      const session = (client as unknown as {
+        session: { prompt: (args: Record<string, unknown>) => Promise<unknown> }
+      }).session
+      await session.prompt({
+        sessionID,
+        parts: [{ type: "text", text, synthetic: true }],
+      })
+    } catch {
+      // Session may have been closed or agent may be busy — silently skip.
+    }
+  }
+
   async function tickToast() {
     let runs: WorkflowRun[]
     try {
@@ -305,6 +393,16 @@ export const server: Plugin = async (input, options) => {
     if (!active) {
       // Run has finished – no need to keep polling
       stopPolling()
+      // Stash runs so tool.execute.after can use them if the push hook fires late.
+      lastCompletedRuns = commitRuns
+      // Prompt any sessions that were waiting for CI results.
+      if (pendingPushSessionIDs.size > 0) {
+        const sids = [...pendingPushSessionIDs]
+        pendingPushSessionIDs.clear()
+        for (const sid of sids) {
+          void promptSessionWithResults(sid, commitRuns)
+        }
+      }
     }
   }
 
@@ -337,11 +435,12 @@ export const server: Plugin = async (input, options) => {
         // Reset tracking so we don't suppress the upcoming run's toast
         trackedRunId = null
         lastToastKey = ""
-        const waitingKey = "info:waiting"
-        if (lastToastKey !== waitingKey) {
-          await sendToast("info", "Waiting for CI...", 30_000)
-          lastToastKey = waitingKey
-        }
+        // Guard against re-sending "Waiting for CI..." on subsequent watcher
+        // ticks for the same SHA (lastToastKey was just cleared above, so a
+        // direct equality check here is correct — we only enter this block once
+        // per SHA change).
+        await sendToast("info", "Waiting for CI...", 30_000)
+        lastToastKey = "info:waiting"
       }
 
       // Check if a run has appeared for this HEAD commit
@@ -401,15 +500,67 @@ export const server: Plugin = async (input, options) => {
     sidebar?: SidebarPanel[]
   }
 
+  const skillsDir = getSkillsDir()
+
   // Start the background watcher immediately on plugin init so that pushes
   // made outside of OpenCode (no session.idle) are still detected.
   startWatcher()
 
   const hooks: HooksWithSidebar = {
+    config: async (config) => {
+      // Register the bundled skills directory so OpenCode discovers the SKILL.md.
+      // The skills property exists at runtime (SDK v2) but may be absent from the
+      // type definitions shipped with the current @opencode-ai/plugin version.
+      const cfg = config as typeof config & { skills?: { paths?: string[]; urls?: string[] } }
+      if (!cfg.skills) cfg.skills = {}
+      if (!cfg.skills.paths) cfg.skills.paths = []
+      if (!cfg.skills.paths.includes(skillsDir)) {
+        cfg.skills.paths.push(skillsDir)
+      }
+    },
+
     event: async ({ event }) => {
       if (event.type === "session.idle") {
         // After an agent turn, skip the watcher delay and poll immediately.
         startPolling()
+      }
+    },
+
+    // Inject skill awareness into the system prompt on every LLM call so the
+    // agent always knows the gh_actions tool is available — even after context
+    // compaction discards earlier messages.
+    "experimental.chat.system.transform": async (_input, output) => {
+      if (!output.system.includes(SKILLS_SYSTEM_PROMPT)) {
+        output.system.push(SKILLS_SYSTEM_PROMPT)
+      }
+    },
+
+    // Ensure the compaction summary preserves awareness of the gh_actions skill.
+    "experimental.session.compacting": async (_input, output) => {
+      const compactionContext =
+        "The gh-actions-status plugin is active. The agent has access to a `gh_actions` tool " +
+        "for checking GitHub Actions workflow statuses and unresolved PR review comments."
+      if (!output.context.includes(compactionContext)) {
+        output.context.push(compactionContext)
+      }
+    },
+
+    // Detect agent-initiated git push commands so we can automatically prompt
+    // the session with CI results once all runs reach a final state.
+    "tool.execute.after": async (input, _output) => {
+      const args = typeof input.args === "string"
+        ? input.args
+        : JSON.stringify(input.args ?? "")
+      if (/\bgit\s+push\b/.test(args)) {
+        // If CI has already finished by the time this hook fires (race condition:
+        // fast CI or a delayed hook invocation), prompt the session immediately
+        // using the stashed completed runs rather than waiting for a future tick
+        // that will never come.
+        if (pollHandle === null && lastCompletedRuns.length > 0) {
+          void promptSessionWithResults(input.sessionID, lastCompletedRuns)
+        } else {
+          pendingPushSessionIDs.add(input.sessionID)
+        }
       }
     },
 
@@ -468,40 +619,10 @@ export const server: Plugin = async (input, options) => {
             return `Failed to fetch workflow runs: ${message}`
           }
 
-          // Filter to only runs for the current HEAD commit
           const headSha = await getHeadCommitSha(cwd)
           const commitRuns = headSha ? filterRunsByCommit(runs, headSha) : runs
-
-          if (commitRuns.length === 0) {
-            return "No workflow runs found for the current commit."
-          }
-
-          const lines = commitRuns.map((run) => {
-            const status = formatStatus(run)
-            const level = mapStatus(run)
-            const icon =
-              level === "success" ? "✓" : level === "error" ? "✗" : level === "warning" ? "⚠" : "●"
-            return `${icon} ${run.name}: ${status} (${run.displayTitle})\n  ${run.url}`
-          })
-
-          const output: string[] = ["## Workflow Runs", lines.join("\n\n")]
-
-          // Fetch unresolved PR review threads
           const threads = await fetchUnresolvedThreads(cwd)
-          if (threads.length > 0) {
-            output.push(`\n## Unresolved Review Comments (${threads.length})`)
-            for (const thread of threads) {
-              const location = thread.line
-                ? `${thread.path}:${thread.line}`
-                : thread.path
-              output.push(`\n### ${location}`)
-              for (const comment of thread.comments) {
-                output.push(`**${comment.author}** (${comment.createdAt}):\n${comment.body}\n${comment.url}`)
-              }
-            }
-          }
-
-          return output.join("\n")
+          return formatRunResults(commitRuns, threads)
         },
       }),
     },
