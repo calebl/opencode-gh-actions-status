@@ -43,6 +43,19 @@ export async function exec(cmd: string[], cwd?: string): Promise<string> {
  */
 export const _exec = { exec }
 
+/**
+ * Returns true if the `gh` CLI is available and authenticated.
+ * Returns a string error message if not.
+ */
+export async function checkGhAvailable(cwd?: string): Promise<true | string> {
+  try {
+    await _exec.exec(["gh", "--version"], cwd)
+    return true
+  } catch {
+    return "GitHub CLI (gh) is not installed or not in PATH. Install it from https://cli.github.com"
+  }
+}
+
 const GH_FIELDS = [
   "databaseId",
   "name",

@@ -1,6 +1,7 @@
 import { tool } from "@opencode-ai/plugin"
 import type { Plugin, Hooks, PluginOptions } from "@opencode-ai/plugin"
 import {
+  checkGhAvailable,
   fetchWorkflowRuns,
   fetchUnresolvedThreads,
   filterRunsByCommit,
@@ -60,6 +61,26 @@ export const server: Plugin = async (input, options) => {
   const config = parseOptions(options)
   const cwd = input.directory as string | undefined
 
+  // Verify gh CLI is available before doing anything else
+  const mockSnapshots = Array.isArray(config.mockRuns) ? config.mockRuns : null
+  if (mockSnapshots === null) {
+    const ghCheck = await checkGhAvailable(cwd)
+    if (ghCheck !== true) {
+      const client = input.client
+      // Show a persistent error toast
+      void (client.tui as unknown as { showToast: (args: { body: { title: string; message: string; variant: string; duration: number } }) => Promise<void> })
+        .showToast({ body: { title: "GitHub Actions", message: ghCheck, variant: "error", duration: 30 * 60 * 1000 } })
+      // Return a no-op plugin with a sidebar error
+      return {
+        sidebar: [{
+          id: "gh-actions-status",
+          title: "GitHub Actions",
+          items: [{ label: "gh CLI not found", status: "error" as const }],
+        }],
+      } as unknown as ReturnType<Plugin>
+    }
+  }
+
   const ghOptions: GhOptions = {
     branch: config.branch,
     limit: config.limit ?? 5,
@@ -77,7 +98,6 @@ export const server: Plugin = async (input, options) => {
 
   // Mock cycle state: index advances on every getRuns() call so each poll tick
   // returns the next snapshot, wrapping at the last one.
-  const mockSnapshots = config.mockRuns ?? null
   let mockIndex = 0
 
   async function getRuns(): Promise<WorkflowRun[]> {

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import {
   _exec,
+  checkGhAvailable,
   mapStatus,
   formatStatus,
   getCurrentBranch,
@@ -118,6 +119,24 @@ describe("formatStatus", () => {
 
   it("falls back to status when conclusion is null", () => {
     expect(formatStatus(makeRun({ status: "completed", conclusion: null }))).toBe("completed")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// checkGhAvailable
+// ---------------------------------------------------------------------------
+
+describe("checkGhAvailable", () => {
+  it("returns true when gh is available", async () => {
+    execSpy.mockResolvedValue("gh version 2.40.0\n")
+    expect(await checkGhAvailable()).toBe(true)
+  })
+
+  it("returns an error string when gh is not found", async () => {
+    execSpy.mockRejectedValue(new Error("spawn gh ENOENT"))
+    const result = await checkGhAvailable()
+    expect(result).not.toBe(true)
+    expect(result).toContain("gh")
   })
 })
 

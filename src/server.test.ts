@@ -147,6 +147,38 @@ async function fireIdle(hooks: Awaited<ReturnType<typeof server>>) {
 }
 
 // ---------------------------------------------------------------------------
+// server — gh CLI not available
+// ---------------------------------------------------------------------------
+
+describe("server — gh not available", () => {
+  it("shows an error toast and returns sidebar error when gh is missing", async () => {
+    execSpy.mockRejectedValue(new Error("spawn gh ENOENT"))
+    const showToast = vi.fn().mockResolvedValue(undefined)
+    const input = {
+      $: vi.fn(),
+      client: { tui: { showToast } },
+      project: {},
+      directory: "/tmp/repo",
+      worktree: "/tmp/repo",
+      serverUrl: "http://localhost:4242",
+    } as unknown as Parameters<typeof server>[0]
+
+    const hooks = await server(input)
+
+    // Should have shown an error toast immediately
+    expect(showToast).toHaveBeenCalledOnce()
+    const body = showToast.mock.calls[0][0].body
+    expect(body.variant).toBe("error")
+    expect(body.message).toContain("gh")
+
+    // Sidebar should show an error item
+    const sidebar = (hooks as unknown as { sidebar: Array<{ items: Array<{ label: string; status: string }> }> }).sidebar
+    expect(sidebar[0].items[0].status).toBe("error")
+    expect(sidebar[0].items[0].label).toContain("gh")
+  })
+})
+
+// ---------------------------------------------------------------------------
 // server — toast behaviour
 // ---------------------------------------------------------------------------
 
