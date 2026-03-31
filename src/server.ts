@@ -105,11 +105,15 @@ export function formatRunResults(runs: WorkflowRun[], threads: ReviewThread[]): 
   return output.join("\n")
 }
 
+// Short reminder injected into every system prompt via experimental.chat.system.transform.
+// This is intentionally brief — the full usage guidance lives in skills/gh-actions/SKILL.md
+// which OpenCode loads when needed. The purpose here is only to ensure the agent never
+// loses awareness of the tool after context compaction discards earlier messages.
 const SKILLS_SYSTEM_PROMPT =
   "The gh-actions-status plugin provides a `gh_actions` tool. " +
   "Use it to check GitHub Actions workflow run statuses and unresolved PR review comments " +
-  "for the current branch. Call it after pushing code, when CI toast notifications appear, " +
-  "when asked about CI status, or before creating a pull request."
+  "for the current branch. Call it after pushing code, when asked about CI status, " +
+  "or before creating a pull request."
 
 export const server: Plugin = async (input, options) => {
   const config = parseOptions(options)
@@ -227,9 +231,14 @@ export const server: Plugin = async (input, options) => {
   let watchHandle: unknown = null
   // Last HEAD SHA seen by the watcher — used to detect new pushes immediately
   let lastSeenSha = ""
-  // Session ID that triggered a git push — when set, the plugin will prompt
-  // that session with CI results once runs reach a final state.
-  let pendingPushSessionID: string | null = null
+  // Session IDs that triggered a git push — when non-empty, the plugin will
+  // prompt each session with CI results once runs reach a final state.
+  // Using a Set so multiple rapid pushes from different sessions are all tracked
+  // and never silently overwrite each other.
+  const pendingPushSessionIDs = new Set<string>()
+  // Runs from the last completed poll cycle — used to immediately prompt a
+  // session if CI has already finished by the time tool.execute.after fires.
+  let lastCompletedRuns: WorkflowRun[] = []
 
   function isRunActive(runs: WorkflowRun[]): boolean {
     return runs.some(
@@ -384,11 +393,15 @@ export const server: Plugin = async (input, options) => {
     if (!active) {
       // Run has finished – no need to keep polling
       stopPolling()
-      // If a git push was detected, prompt the originating session with results.
-      if (pendingPushSessionID !== null) {
-        const sid = pendingPushSessionID
-        pendingPushSessionID = null
-        void promptSessionWithResults(sid, commitRuns)
+      // Stash runs so tool.execute.after can use them if the push hook fires late.
+      lastCompletedRuns = commitRuns
+      // Prompt any sessions that were waiting for CI results.
+      if (pendingPushSessionIDs.size > 0) {
+        const sids = [...pendingPushSessionIDs]
+        pendingPushSessionIDs.clear()
+        for (const sid of sids) {
+          void promptSessionWithResults(sid, commitRuns)
+        }
       }
     }
   }
@@ -422,11 +435,12 @@ export const server: Plugin = async (input, options) => {
         // Reset tracking so we don't suppress the upcoming run's toast
         trackedRunId = null
         lastToastKey = ""
-        const waitingKey = "info:waiting"
-        if (lastToastKey !== waitingKey) {
-          await sendToast("info", "Waiting for CI...", 30_000)
-          lastToastKey = waitingKey
-        }
+        // Guard against re-sending "Waiting for CI..." on subsequent watcher
+        // ticks for the same SHA (lastToastKey was just cleared above, so a
+        // direct equality check here is correct — we only enter this block once
+        // per SHA change).
+        await sendToast("info", "Waiting for CI...", 30_000)
+        lastToastKey = "info:waiting"
       }
 
       // Check if a run has appeared for this HEAD commit
@@ -523,10 +537,12 @@ export const server: Plugin = async (input, options) => {
 
     // Ensure the compaction summary preserves awareness of the gh_actions skill.
     "experimental.session.compacting": async (_input, output) => {
-      output.context.push(
+      const compactionContext =
         "The gh-actions-status plugin is active. The agent has access to a `gh_actions` tool " +
-          "for checking GitHub Actions workflow statuses and unresolved PR review comments.",
-      )
+        "for checking GitHub Actions workflow statuses and unresolved PR review comments."
+      if (!output.context.includes(compactionContext)) {
+        output.context.push(compactionContext)
+      }
     },
 
     // Detect agent-initiated git push commands so we can automatically prompt
@@ -536,7 +552,15 @@ export const server: Plugin = async (input, options) => {
         ? input.args
         : JSON.stringify(input.args ?? "")
       if (/\bgit\s+push\b/.test(args)) {
-        pendingPushSessionID = input.sessionID
+        // If CI has already finished by the time this hook fires (race condition:
+        // fast CI or a delayed hook invocation), prompt the session immediately
+        // using the stashed completed runs rather than waiting for a future tick
+        // that will never come.
+        if (pollHandle === null && lastCompletedRuns.length > 0) {
+          void promptSessionWithResults(input.sessionID, lastCompletedRuns)
+        } else {
+          pendingPushSessionIDs.add(input.sessionID)
+        }
       }
     },
 

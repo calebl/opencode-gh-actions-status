@@ -5,7 +5,7 @@ Check GitHub Actions workflow run statuses and unresolved PR review comments for
 ## When to use
 
 - After pushing code or when asked about CI status
-- When a toast notification indicates CI is running, passing, or failing
+- When prompted by the plugin with CI results after a push
 - When asked to fix CI failures or address review comments
 - Before creating a pull request to verify all checks pass
 

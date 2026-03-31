@@ -1,6 +1,4 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import { resolve, dirname } from "node:path"
-import { fileURLToPath } from "node:url"
 import { _exec } from "./gh.js"
 import { parseOptions, server, formatRunResults } from "./server.js"
 import type { WorkflowRun } from "./gh.js"
@@ -723,6 +721,19 @@ describe("server — session compacting hook", () => {
     expect(output.context.length).toBe(1)
     expect(output.context[0]).toContain("gh-actions-status")
     expect(output.context[0]).toContain("gh_actions")
+  })
+
+  it("does not duplicate context on repeated compaction calls", async () => {
+    const runs = [makeRun({ conclusion: "success" })]
+    const { input } = makeInput(runs)
+    const hooks = await server(input)
+
+    const compacting = hooks["experimental.session.compacting"]!
+    const output = { context: [] as string[] }
+    await compacting({ sessionID: "s1" }, output)
+    await compacting({ sessionID: "s1" }, output)
+
+    expect(output.context.length).toBe(1)
   })
 })
 
