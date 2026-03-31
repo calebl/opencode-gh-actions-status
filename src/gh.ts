@@ -151,6 +151,97 @@ export async function fetchUnresolvedThreads(cwd?: string): Promise<ReviewThread
   }
 }
 
+/**
+ * Resolves a PR review thread by its node ID.
+ * Returns true on success or an error message string on failure.
+ *
+ * To obtain thread node IDs, call fetchUnresolvedThreadsWithIds which
+ * returns threads augmented with their GraphQL node IDs.
+ */
+export async function resolveThread(threadId: string, cwd?: string): Promise<true | string> {
+  try {
+    const mutation = `mutation {
+      resolveReviewThread(input: { threadId: "${threadId}" }) {
+        thread { id isResolved }
+      }
+    }`
+    await _exec.exec(["gh", "api", "graphql", "-f", `query=${mutation}`], cwd)
+    return true
+  } catch (err) {
+    return err instanceof Error ? err.message : "Unknown error resolving thread"
+  }
+}
+
+/**
+ * Like fetchUnresolvedThreads but also returns the GraphQL node `id` for each
+ * thread so callers can pass it to resolveThread().
+ */
+export interface ReviewThreadWithId extends ReviewThread {
+  id: string
+}
+
+export async function fetchUnresolvedThreadsWithIds(cwd?: string): Promise<ReviewThreadWithId[]> {
+  try {
+    const prJson = await _exec.exec(["gh", "pr", "view", "--json", "number"], cwd)
+    const { number } = JSON.parse(prJson.trim()) as { number: number }
+    if (!number) return []
+
+    const remoteUrl = await _exec.exec(["git", "remote", "get-url", "origin"], cwd)
+    const match = remoteUrl.trim().match(/[:/]([^/]+)\/([^/.]+?)(\.git)?$/)
+    if (!match) return []
+    const [, owner, repo] = match
+
+    const query = `{
+      repository(owner:"${owner}", name:"${repo}") {
+        pullRequest(number:${number}) {
+          reviewThreads(first:100) {
+            nodes {
+              id
+              isResolved
+              path
+              line
+              diffSide
+              comments(first:50) {
+                nodes {
+                  author { login }
+                  body
+                  createdAt
+                  url
+                }
+              }
+            }
+          }
+        }
+      }
+    }`
+    const result = await _exec.exec(["gh", "api", "graphql", "-f", `query=${query}`], cwd)
+    const data = JSON.parse(result.trim())
+    const nodes = data?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? []
+    return nodes
+      .filter((t: { isResolved: boolean }) => !t.isResolved)
+      .map((t: {
+        id: string
+        path: string
+        line: number | null
+        diffSide: string
+        comments: { nodes: Array<{ author: { login: string }; body: string; createdAt: string; url: string }> }
+      }) => ({
+        id: t.id,
+        path: t.path,
+        line: t.line ?? null,
+        diffSide: t.diffSide,
+        comments: t.comments.nodes.map((c) => ({
+          author: c.author.login,
+          body: c.body,
+          createdAt: c.createdAt,
+          url: c.url,
+        })),
+      }))
+  } catch {
+    return []
+  }
+}
+
 export async function getCurrentBranch(cwd?: string): Promise<string> {
   try {
     const result = await _exec.exec(["git", "branch", "--show-current"], cwd)

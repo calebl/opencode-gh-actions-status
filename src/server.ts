@@ -4,12 +4,13 @@ import {
   checkGhAvailable,
   fetchWorkflowRuns,
   fetchUnresolvedThreads,
+  fetchUnresolvedThreadsWithIds,
+  resolveThread,
   filterRunsByCommit,
   getHeadCommitSha,
   mapStatus,
   formatStatus,
   type WorkflowRun,
-  type ReviewThread,
   type GhOptions,
 } from "./gh.js"
 
@@ -486,15 +487,16 @@ export const server: Plugin = async (input, options) => {
 
           const output: string[] = ["## Workflow Runs", lines.join("\n\n")]
 
-          // Fetch unresolved PR review threads
-          const threads = await fetchUnresolvedThreads(cwd)
+          // Fetch unresolved PR review threads (with node IDs for resolving)
+          const threads = await fetchUnresolvedThreadsWithIds(cwd)
           if (threads.length > 0) {
             output.push(`\n## Unresolved Review Comments (${threads.length})`)
+            output.push("Use the `resolve_comment` tool with the thread ID to mark a thread as resolved.")
             for (const thread of threads) {
               const location = thread.line
                 ? `${thread.path}:${thread.line}`
                 : thread.path
-              output.push(`\n### ${location}`)
+              output.push(`\n### ${location} (thread ID: ${thread.id})`)
               for (const comment of thread.comments) {
                 output.push(`**${comment.author}** (${comment.createdAt}):\n${comment.body}\n${comment.url}`)
               }
@@ -502,6 +504,38 @@ export const server: Plugin = async (input, options) => {
           }
 
           return output.join("\n")
+        },
+      }),
+
+      resolve_comment: tool({
+        description:
+          "Resolve one or more unresolved PR review threads by their thread ID. " +
+          "Use gh_actions first to list unresolved threads and obtain their IDs, " +
+          "then call this tool with the thread ID(s) to mark them as resolved on GitHub.",
+        args: {
+          threadIds: tool.schema
+            .array(tool.schema.string())
+            .describe(
+              "Array of GraphQL review thread node IDs to resolve. " +
+              "Obtain these by calling gh_actions which returns thread IDs " +
+              "alongside the unresolved comment text.",
+            ),
+        },
+        async execute(args) {
+          if (!args.threadIds || args.threadIds.length === 0) {
+            return "No thread IDs provided. Pass one or more thread node IDs to resolve."
+          }
+
+          const results: string[] = []
+          for (const threadId of args.threadIds) {
+            const outcome = await resolveThread(threadId, cwd)
+            if (outcome === true) {
+              results.push(`✓ Resolved thread ${threadId}`)
+            } else {
+              results.push(`✗ Failed to resolve thread ${threadId}: ${outcome}`)
+            }
+          }
+          return results.join("\n")
         },
       }),
     },

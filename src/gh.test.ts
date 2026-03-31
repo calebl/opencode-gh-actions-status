@@ -8,6 +8,8 @@ import {
   getHeadCommitSha,
   fetchWorkflowRuns,
   fetchUnresolvedThreads,
+  fetchUnresolvedThreadsWithIds,
+  resolveThread,
   filterRunsByCommit,
   type WorkflowRun,
 } from "./gh.js"
@@ -317,5 +319,128 @@ describe("filterRunsByCommit", () => {
   it("returns empty array when no runs match the SHA", () => {
     const runs = [makeRun({ headSha: "abc123" }), makeRun({ headSha: "abc123" })]
     expect(filterRunsByCommit(runs, "zzz999")).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// resolveThread
+// ---------------------------------------------------------------------------
+
+describe("resolveThread", () => {
+  it("returns true when the mutation succeeds", async () => {
+    execSpy.mockResolvedValueOnce(
+      JSON.stringify({ data: { resolveReviewThread: { thread: { id: "T_abc", isResolved: true } } } }),
+    )
+    expect(await resolveThread("T_abc")).toBe(true)
+    expect(execSpy).toHaveBeenCalledOnce()
+    const callArgs = execSpy.mock.calls[0][0] as string[]
+    expect(callArgs).toContain("graphql")
+    expect(callArgs.join(" ")).toContain("T_abc")
+  })
+
+  it("returns an error string when the mutation throws", async () => {
+    execSpy.mockRejectedValueOnce(new Error("Not authorized"))
+    const result = await resolveThread("T_bad")
+    expect(result).not.toBe(true)
+    expect(result).toContain("Not authorized")
+  })
+
+  it("returns a generic error string for non-Error rejections", async () => {
+    execSpy.mockRejectedValueOnce("oops")
+    const result = await resolveThread("T_bad")
+    expect(result).toBe("Unknown error resolving thread")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// fetchUnresolvedThreadsWithIds
+// ---------------------------------------------------------------------------
+
+describe("fetchUnresolvedThreadsWithIds", () => {
+  const prResponse = JSON.stringify({ number: 42 })
+  const remoteUrl = "git@github.com:owner/repo.git\n"
+
+  const makeGraphqlResponseWithIds = (
+    threads: Array<{
+      id: string
+      isResolved: boolean
+      path: string
+      line: number | null
+      diffSide: string
+      comments: { nodes: Array<{ author: { login: string }; body: string; createdAt: string; url: string }> }
+    }>,
+  ) =>
+    JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: threads } } } } })
+
+  it("returns unresolved threads with their node IDs", async () => {
+    const thread = {
+      id: "PRRT_kwDOABC123",
+      isResolved: false,
+      path: "src/foo.ts",
+      line: 10,
+      diffSide: "RIGHT",
+      comments: {
+        nodes: [
+          {
+            author: { login: "alice" },
+            body: "Please fix this",
+            createdAt: "2024-01-01T00:00:00Z",
+            url: "https://github.com/owner/repo/pull/42#discussion_r1",
+          },
+        ],
+      },
+    }
+    execSpy
+      .mockResolvedValueOnce(prResponse)
+      .mockResolvedValueOnce(remoteUrl)
+      .mockResolvedValueOnce(makeGraphqlResponseWithIds([thread]))
+
+    const result = await fetchUnresolvedThreadsWithIds()
+    expect(result).toHaveLength(1)
+    expect(result[0].id).toBe("PRRT_kwDOABC123")
+    expect(result[0].path).toBe("src/foo.ts")
+    expect(result[0].line).toBe(10)
+    expect(result[0].comments[0].author).toBe("alice")
+  })
+
+  it("filters out resolved threads", async () => {
+    const threads = [
+      {
+        id: "T_1",
+        isResolved: false,
+        path: "a.ts",
+        line: 1,
+        diffSide: "RIGHT",
+        comments: { nodes: [{ author: { login: "a" }, body: "x", createdAt: "", url: "" }] },
+      },
+      {
+        id: "T_2",
+        isResolved: true,
+        path: "b.ts",
+        line: 2,
+        diffSide: "RIGHT",
+        comments: { nodes: [{ author: { login: "b" }, body: "y", createdAt: "", url: "" }] },
+      },
+    ]
+    execSpy
+      .mockResolvedValueOnce(prResponse)
+      .mockResolvedValueOnce(remoteUrl)
+      .mockResolvedValueOnce(makeGraphqlResponseWithIds(threads))
+
+    const result = await fetchUnresolvedThreadsWithIds()
+    expect(result).toHaveLength(1)
+    expect(result[0].id).toBe("T_1")
+  })
+
+  it("returns empty array when no PR exists", async () => {
+    execSpy.mockRejectedValueOnce(new Error("no PR found"))
+    expect(await fetchUnresolvedThreadsWithIds()).toEqual([])
+  })
+
+  it("returns empty array when remote URL cannot be parsed", async () => {
+    execSpy
+      .mockResolvedValueOnce(prResponse)
+      .mockResolvedValueOnce("not-a-git-url\n")
+    expect(await fetchUnresolvedThreadsWithIds()).toEqual([])
   })
 })
