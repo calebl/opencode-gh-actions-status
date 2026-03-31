@@ -57,6 +57,87 @@ const GH_FIELDS = [
   "updatedAt",
 ].join(",")
 
+export interface ReviewComment {
+  author: string
+  body: string
+  createdAt: string
+  url: string
+}
+
+export interface ReviewThread {
+  path: string
+  line: number | null
+  diffSide: string
+  comments: ReviewComment[]
+}
+
+/**
+ * Returns all unresolved review threads on the PR for the current branch,
+ * including the full comment text so agents can read and act on them.
+ * Returns an empty array if there is no open PR or the data cannot be fetched.
+ */
+export async function fetchUnresolvedThreads(cwd?: string): Promise<ReviewThread[]> {
+  try {
+    // Get current PR number
+    const prJson = await _exec.exec(["gh", "pr", "view", "--json", "number"], cwd)
+    const { number } = JSON.parse(prJson.trim()) as { number: number }
+    if (!number) return []
+
+    // Get repo info (owner/name) from git remote
+    const remoteUrl = await _exec.exec(["git", "remote", "get-url", "origin"], cwd)
+    const match = remoteUrl.trim().match(/[:/]([^/]+)\/([^/.]+?)(\.git)?$/)
+    if (!match) return []
+    const [, owner, repo] = match
+
+    // Fetch unresolved review threads with full comment data via GraphQL
+    const query = `{
+      repository(owner:"${owner}", name:"${repo}") {
+        pullRequest(number:${number}) {
+          reviewThreads(first:100) {
+            nodes {
+              isResolved
+              path
+              line
+              diffSide
+              comments(first:50) {
+                nodes {
+                  author { login }
+                  body
+                  createdAt
+                  url
+                }
+              }
+            }
+          }
+        }
+      }
+    }`
+    const result = await _exec.exec(["gh", "api", "graphql", "-f", `query=${query}`], cwd)
+    const data = JSON.parse(result.trim())
+    const nodes = data?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? []
+    return nodes
+      .filter((t: { isResolved: boolean }) => !t.isResolved)
+      .map((t: {
+        path: string
+        line: number | null
+        diffSide: string
+        comments: { nodes: Array<{ author: { login: string }; body: string; createdAt: string; url: string }> }
+      }) => ({
+        path: t.path,
+        line: t.line ?? null,
+        diffSide: t.diffSide,
+        comments: t.comments.nodes.map((c) => ({
+          author: c.author.login,
+          body: c.body,
+          createdAt: c.createdAt,
+          url: c.url,
+        })),
+      }))
+  } catch {
+    return []
+  }
+}
+
 export async function getCurrentBranch(cwd?: string): Promise<string> {
   try {
     const result = await _exec.exec(["git", "branch", "--show-current"], cwd)

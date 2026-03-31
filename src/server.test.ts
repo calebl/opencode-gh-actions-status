@@ -107,16 +107,22 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
 }
 
 /**
- * Configure execSpy to handle the three command types the plugin calls:
+ * Configure execSpy to handle all command types the plugin calls:
  *   git branch --show-current  → "main"
  *   git rev-parse HEAD          → TEST_HEAD_SHA
+ *   git remote get-url origin   → mock remote URL
  *   gh run list …               → JSON of runs
+ *   gh pr view …                → no PR (so unresolved count = 0)
+ *   gh api graphql …            → empty threads
  */
 function setupExecMock(runs: WorkflowRun[]) {
   const runsJson = JSON.stringify(runs)
   execSpy.mockImplementation((cmd: string[]) => {
-    if (cmd.includes("branch")) return Promise.resolve("main\n")
+    if (cmd.includes("branch") && !cmd.includes("gh")) return Promise.resolve("main\n")
     if (cmd.includes("rev-parse")) return Promise.resolve(TEST_HEAD_SHA + "\n")
+    if (cmd.includes("remote")) return Promise.resolve("git@github.com:owner/repo.git\n")
+    if (cmd.includes("pr")) return Promise.reject(new Error("no PR"))
+    if (cmd.includes("graphql")) return Promise.resolve(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }))
     return Promise.resolve(runsJson)
   })
 }
@@ -278,8 +284,11 @@ describe("server — toast on session.idle", () => {
     const showToast = vi.fn().mockResolvedValue(undefined)
     let ghCallCount = 0
     execSpy.mockImplementation((cmd: string[]) => {
-      if (cmd.includes("branch")) return Promise.resolve("main\n")
+      if (cmd.includes("branch") && !cmd.includes("gh")) return Promise.resolve("main\n")
       if (cmd.includes("rev-parse")) return Promise.resolve(TEST_HEAD_SHA + "\n")
+      if (cmd.includes("remote")) return Promise.resolve("git@github.com:owner/repo.git\n")
+      if (cmd.includes("pr")) return Promise.reject(new Error("no PR"))
+      if (cmd.includes("graphql")) return Promise.resolve(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }))
       ghCallCount++
       return Promise.resolve(JSON.stringify(ghCallCount === 1 ? [activeRun] : [updatedRun]))
     })
@@ -311,8 +320,11 @@ describe("server — toast on session.idle", () => {
     const showToast = vi.fn().mockResolvedValue(undefined)
     let serveSecondRun = false
     execSpy.mockImplementation((cmd: string[]) => {
-      if (cmd.includes("branch")) return Promise.resolve("main\n")
+      if (cmd.includes("branch") && !cmd.includes("gh")) return Promise.resolve("main\n")
       if (cmd.includes("rev-parse")) return Promise.resolve(TEST_HEAD_SHA + "\n")
+      if (cmd.includes("remote")) return Promise.resolve("git@github.com:owner/repo.git\n")
+      if (cmd.includes("pr")) return Promise.reject(new Error("no PR"))
+      if (cmd.includes("graphql")) return Promise.resolve(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }))
       return Promise.resolve(JSON.stringify(serveSecondRun ? [secondRun] : [firstRun]))
     })
 
@@ -471,5 +483,86 @@ describe("server — gh_actions tool", () => {
 
     const result = await (hooks as unknown as { tool: { gh_actions: { execute: (a: object) => Promise<string> } } }).tool.gh_actions.execute({})
     expect(result).toMatch(/no workflow runs/i)
+  })
+
+  it("includes unresolved review comments in tool output", async () => {
+    const runs = [makeRun({ name: "CI", conclusion: "success", displayTitle: "my PR" })]
+    const graphqlResponse = JSON.stringify({
+      data: { repository: { pullRequest: { reviewThreads: { nodes: [
+        {
+          isResolved: false,
+          path: "src/foo.ts",
+          line: 42,
+          diffSide: "RIGHT",
+          comments: { nodes: [{
+            author: { login: "alice" },
+            body: "Please address this",
+            createdAt: "2024-01-01T00:00:00Z",
+            url: "https://github.com/owner/repo/pull/1#discussion_r1",
+          }] },
+        },
+      ] } } } },
+    })
+
+    execSpy.mockImplementation((cmd: string[]) => {
+      if (cmd.includes("branch") && !cmd.includes("gh")) return Promise.resolve("main\n")
+      if (cmd.includes("rev-parse")) return Promise.resolve(TEST_HEAD_SHA + "\n")
+      if (cmd.includes("remote")) return Promise.resolve("git@github.com:owner/repo.git\n")
+      if (cmd.includes("pr")) return Promise.resolve(JSON.stringify({ number: 1 }))
+      if (cmd.includes("graphql")) return Promise.resolve(graphqlResponse)
+      return Promise.resolve(JSON.stringify(runs))
+    })
+
+    const input = {
+      $: vi.fn(),
+      client: { tui: { showToast: vi.fn().mockResolvedValue(undefined) } },
+      project: {},
+      directory: "/tmp/repo",
+      worktree: "/tmp/repo",
+      serverUrl: "http://localhost:4242",
+    } as unknown as Parameters<typeof server>[0]
+
+    const hooks = await server(input)
+    const result = await (hooks as unknown as { tool: { gh_actions: { execute: (a: object) => Promise<string> } } }).tool.gh_actions.execute({})
+    expect(result).toContain("Unresolved Review Comments (1)")
+    expect(result).toContain("src/foo.ts:42")
+    expect(result).toContain("alice")
+    expect(result).toContain("Please address this")
+  })
+
+  it("includes unresolved count in toast message", async () => {
+    const runs = [makeRun({ conclusion: "success" })]
+    const graphqlResponse = JSON.stringify({
+      data: { repository: { pullRequest: { reviewThreads: { nodes: [
+        { isResolved: false, path: "src/foo.ts", line: 1, diffSide: "RIGHT", comments: { nodes: [{ author: { login: "bob" }, body: "fix", createdAt: "", url: "" }] } },
+        { isResolved: false, path: "src/bar.ts", line: 2, diffSide: "RIGHT", comments: { nodes: [{ author: { login: "bob" }, body: "also fix", createdAt: "", url: "" }] } },
+      ] } } } },
+    })
+
+    const showToast = vi.fn().mockResolvedValue(undefined)
+    execSpy.mockImplementation((cmd: string[]) => {
+      if (cmd.includes("branch") && !cmd.includes("gh")) return Promise.resolve("main\n")
+      if (cmd.includes("rev-parse")) return Promise.resolve(TEST_HEAD_SHA + "\n")
+      if (cmd.includes("remote")) return Promise.resolve("git@github.com:owner/repo.git\n")
+      if (cmd.includes("pr")) return Promise.resolve(JSON.stringify({ number: 1 }))
+      if (cmd.includes("graphql")) return Promise.resolve(graphqlResponse)
+      return Promise.resolve(JSON.stringify(runs))
+    })
+
+    const input = {
+      $: vi.fn(),
+      client: { tui: { showToast } },
+      project: {},
+      directory: "/tmp/repo",
+      worktree: "/tmp/repo",
+      serverUrl: "http://localhost:4242",
+    } as unknown as Parameters<typeof server>[0]
+
+    await server(input)
+    await vi.runOnlyPendingTimersAsync()
+
+    const body = lastToastBody(showToast)
+    expect(body.message).toContain("1 passing")
+    expect(body.message).toContain("2 unresolved")
   })
 })

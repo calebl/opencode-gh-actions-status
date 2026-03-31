@@ -6,6 +6,7 @@ import {
   getCurrentBranch,
   getHeadCommitSha,
   fetchWorkflowRuns,
+  fetchUnresolvedThreads,
   filterRunsByCommit,
   type WorkflowRun,
 } from "./gh.js"
@@ -201,6 +202,72 @@ describe("fetchWorkflowRuns", () => {
 
     const result = await fetchWorkflowRuns({ limit: 3 })
     expect(result).toHaveLength(3)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// fetchUnresolvedThreads
+// ---------------------------------------------------------------------------
+
+describe("fetchUnresolvedThreads", () => {
+  const prResponse = JSON.stringify({ number: 42 })
+  const remoteUrl = "git@github.com:owner/repo.git\n"
+  const makeGraphqlResponse = (threads: Array<{ isResolved: boolean; path: string; line: number | null; diffSide: string; comments: { nodes: Array<{ author: { login: string }; body: string; createdAt: string; url: string }> } }>) =>
+    JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: threads } } } } })
+
+  it("returns unresolved threads with full comment data", async () => {
+    const thread = {
+      isResolved: false,
+      path: "src/foo.ts",
+      line: 10,
+      diffSide: "RIGHT",
+      comments: {
+        nodes: [{
+          author: { login: "alice" },
+          body: "Please fix this",
+          createdAt: "2024-01-01T00:00:00Z",
+          url: "https://github.com/owner/repo/pull/42#discussion_r1",
+        }],
+      },
+    }
+    execSpy
+      .mockResolvedValueOnce(prResponse)
+      .mockResolvedValueOnce(remoteUrl)
+      .mockResolvedValueOnce(makeGraphqlResponse([thread]))
+
+    const result = await fetchUnresolvedThreads()
+    expect(result).toHaveLength(1)
+    expect(result[0].path).toBe("src/foo.ts")
+    expect(result[0].line).toBe(10)
+    expect(result[0].comments[0].author).toBe("alice")
+    expect(result[0].comments[0].body).toBe("Please fix this")
+  })
+
+  it("filters out resolved threads", async () => {
+    const threads = [
+      { isResolved: false, path: "a.ts", line: 1, diffSide: "RIGHT", comments: { nodes: [{ author: { login: "a" }, body: "x", createdAt: "", url: "" }] } },
+      { isResolved: true,  path: "b.ts", line: 2, diffSide: "RIGHT", comments: { nodes: [{ author: { login: "b" }, body: "y", createdAt: "", url: "" }] } },
+    ]
+    execSpy
+      .mockResolvedValueOnce(prResponse)
+      .mockResolvedValueOnce(remoteUrl)
+      .mockResolvedValueOnce(makeGraphqlResponse(threads))
+
+    const result = await fetchUnresolvedThreads()
+    expect(result).toHaveLength(1)
+    expect(result[0].path).toBe("a.ts")
+  })
+
+  it("returns empty array when no PR exists", async () => {
+    execSpy.mockRejectedValueOnce(new Error("no PR found"))
+    expect(await fetchUnresolvedThreads()).toEqual([])
+  })
+
+  it("returns empty array when remote URL cannot be parsed", async () => {
+    execSpy
+      .mockResolvedValueOnce(prResponse)
+      .mockResolvedValueOnce("not-a-git-url\n")
+    expect(await fetchUnresolvedThreads()).toEqual([])
   })
 })
 

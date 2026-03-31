@@ -2,11 +2,13 @@ import { tool } from "@opencode-ai/plugin"
 import type { Plugin, Hooks, PluginOptions } from "@opencode-ai/plugin"
 import {
   fetchWorkflowRuns,
+  fetchUnresolvedThreads,
   filterRunsByCommit,
   getHeadCommitSha,
   mapStatus,
   formatStatus,
   type WorkflowRun,
+  type ReviewThread,
   type GhOptions,
 } from "./gh.js"
 
@@ -167,7 +169,10 @@ export const server: Plugin = async (input, options) => {
     )
   }
 
-  function buildToastPayload(runs: WorkflowRun[]): {
+  function buildToastPayload(
+    runs: WorkflowRun[],
+    unresolvedCount = 0,
+  ): {
     variant: "success" | "warning" | "error" | "info"
     summary: string
   } {
@@ -192,7 +197,8 @@ export const server: Plugin = async (input, options) => {
     if (counts.success) parts.push(`${counts.success} passing`)
     if (counts.error) parts.push(`${counts.error} failing`)
     if (counts.warning) parts.push(`${counts.warning} cancelled`)
-    return { variant, summary: parts.join(" · ") }
+    if (unresolvedCount > 0) parts.push(`${unresolvedCount} unresolved`)
+    return { variant, summary: parts.join("\n") }
   }
 
   async function sendToast(
@@ -267,7 +273,10 @@ export const server: Plugin = async (input, options) => {
 
     trackedRunId = newestId
     const active = isRunActive(commitRuns)
-    const { variant, summary } = buildToastPayload(commitRuns)
+    const unresolvedCount = mockSnapshots === null
+      ? await fetchUnresolvedThreads(cwd).then((t) => t.length)
+      : 0
+    const { variant, summary } = buildToastPayload(commitRuns, unresolvedCount)
     const toastKey = `${variant}:${summary}`
 
     if (toastKey !== lastToastKey) {
@@ -415,8 +424,9 @@ export const server: Plugin = async (input, options) => {
     tool: {
       gh_actions: tool({
         description:
-          "Check GitHub Actions workflow run statuses for the current branch. " +
-          "Returns the latest workflow runs with their name, status, conclusion, and URL.",
+          "Check GitHub Actions workflow run statuses and unresolved PR review comments " +
+          "for the current branch. Returns workflow runs with their status and URL, plus " +
+          "full text of any unresolved review threads so you can read and address them.",
         args: {
           branch: tool.schema
             .string()
@@ -459,7 +469,24 @@ export const server: Plugin = async (input, options) => {
             return `${icon} ${run.name}: ${status} (${run.displayTitle})\n  ${run.url}`
           })
 
-          return lines.join("\n\n")
+          const output: string[] = ["## Workflow Runs", lines.join("\n\n")]
+
+          // Fetch unresolved PR review threads
+          const threads = await fetchUnresolvedThreads(cwd)
+          if (threads.length > 0) {
+            output.push(`\n## Unresolved Review Comments (${threads.length})`)
+            for (const thread of threads) {
+              const location = thread.line
+                ? `${thread.path}:${thread.line}`
+                : thread.path
+              output.push(`\n### ${location}`)
+              for (const comment of thread.comments) {
+                output.push(`**${comment.author}** (${comment.createdAt}):\n${comment.body}\n${comment.url}`)
+              }
+            }
+          }
+
+          return output.join("\n")
         },
       }),
     },
