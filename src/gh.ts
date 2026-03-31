@@ -16,12 +16,32 @@ export interface GhOptions {
   branch?: string
   limit?: number
   workflows?: string[]
+  cwd?: string
 }
 
-export type ShellFn = (
-  strings: TemplateStringsArray,
-  ...expressions: unknown[]
-) => { quiet(): { text(): Promise<string> } }
+/**
+ * Execute a command using Bun.spawn and return its stdout as a string.
+ * Works from any context including background timers.
+ */
+export async function exec(cmd: string[], cwd?: string): Promise<string> {
+  const proc = Bun.spawn(cmd, {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  const exitCode = await proc.exited
+  if (exitCode !== 0) {
+    const err = await new Response(proc.stderr).text()
+    throw new Error(err.trim() || `Command exited with code ${exitCode}`)
+  }
+  return new Response(proc.stdout).text()
+}
+
+/**
+ * Indirection object so tests can replace the exec implementation without
+ * needing ES module live-binding tricks. All internal callers use _exec.exec.
+ */
+export const _exec = { exec }
 
 const GH_FIELDS = [
   "databaseId",
@@ -37,18 +57,18 @@ const GH_FIELDS = [
   "updatedAt",
 ].join(",")
 
-export async function getCurrentBranch($: ShellFn): Promise<string> {
+export async function getCurrentBranch(cwd?: string): Promise<string> {
   try {
-    const result = await $`git branch --show-current`.quiet().text()
+    const result = await _exec.exec(["git", "branch", "--show-current"], cwd)
     return result.trim()
   } catch {
     return ""
   }
 }
 
-export async function getHeadCommitSha($: ShellFn): Promise<string> {
+export async function getHeadCommitSha(cwd?: string): Promise<string> {
   try {
-    const result = await $`git rev-parse HEAD`.quiet().text()
+    const result = await _exec.exec(["git", "rev-parse", "HEAD"], cwd)
     return result.trim()
   } catch {
     return ""
@@ -56,17 +76,17 @@ export async function getHeadCommitSha($: ShellFn): Promise<string> {
 }
 
 export async function fetchWorkflowRuns(
-  $: ShellFn,
   options: GhOptions = {},
 ): Promise<WorkflowRun[]> {
-  const { branch, limit = 5, workflows } = options
+  const { branch, limit = 5, workflows, cwd } = options
 
   const currentBranch =
-    branch && branch !== "current" ? branch : await getCurrentBranch($)
+    branch && branch !== "current" ? branch : await getCurrentBranch(cwd)
 
   if (!currentBranch) return []
 
   const args = [
+    "gh",
     "run",
     "list",
     "--branch",
@@ -83,7 +103,7 @@ export async function fetchWorkflowRuns(
     }
   }
 
-  const result = await $`gh ${args}`.quiet().text()
+  const result = await _exec.exec(args, cwd)
   const parsed = JSON.parse(result.trim())
 
   if (!Array.isArray(parsed)) {

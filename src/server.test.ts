@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import { parseOptions } from "./server.js"
-import { server } from "./server.js"
-import type { WorkflowRun, ShellFn } from "./gh.js"
+import { _exec } from "./gh.js"
+import { parseOptions, server } from "./server.js"
+import type { WorkflowRun } from "./gh.js"
+
+// ---------------------------------------------------------------------------
+// Spy on exec so tests don't spawn real processes
+// ---------------------------------------------------------------------------
+
+let execSpy: ReturnType<typeof vi.spyOn>
 
 // ---------------------------------------------------------------------------
 // parseOptions
@@ -66,7 +72,7 @@ describe("parseOptions", () => {
 
   it("extracts valid mockRuns array", () => {
     const snapshot = [{ databaseId: 1, name: "CI", status: "in_progress", conclusion: null,
-      headBranch: "main", event: "push", url: "https://github.com/x/y/runs/1",
+      headBranch: "main", headSha: "abc", event: "push", url: "https://github.com/x/y/runs/1",
       displayTitle: "mock", createdAt: "2024-01-01T00:00:00Z", updatedAt: "2024-01-01T00:00:00Z" }]
     expect(parseOptions({ mockRuns: [snapshot] })).toMatchObject({ mockRuns: [snapshot] })
   })
@@ -81,7 +87,6 @@ describe("parseOptions", () => {
 // ---------------------------------------------------------------------------
 
 let runIdCounter = 1
-
 const TEST_HEAD_SHA = "deadbeef1234"
 
 function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
@@ -102,39 +107,32 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
 }
 
 /**
- * Build a PluginInput mock whose shell handles:
+ * Configure execSpy to handle the three command types the plugin calls:
  *   git branch --show-current  → "main"
  *   git rev-parse HEAD          → TEST_HEAD_SHA
- *   gh run list …               → runsJson
- * Any extra calls fall back to runsJson.
+ *   gh run list …               → JSON of runs
  */
-function makeInput(runs: WorkflowRun[]) {
+function setupExecMock(runs: WorkflowRun[]) {
   const runsJson = JSON.stringify(runs)
+  execSpy.mockImplementation((cmd: string[]) => {
+    if (cmd.includes("branch")) return Promise.resolve("main\n")
+    if (cmd.includes("rev-parse")) return Promise.resolve(TEST_HEAD_SHA + "\n")
+    return Promise.resolve(runsJson)
+  })
+}
+
+function makeInput(runs: WorkflowRun[]) {
+  setupExecMock(runs)
   const showToast = vi.fn().mockResolvedValue(undefined)
-
-  const $ = vi
-    .fn()
-    .mockImplementation((strings: TemplateStringsArray, ...args: unknown[]) => {
-      const cmd = strings.raw.join("").trim() + (args.length ? " " + args.join(" ") : "")
-      if (cmd.includes("branch --show-current")) {
-        return { quiet: () => ({ text: () => Promise.resolve("main\n") }) }
-      }
-      if (cmd.includes("rev-parse HEAD")) {
-        return { quiet: () => ({ text: () => Promise.resolve(TEST_HEAD_SHA + "\n") }) }
-      }
-      return { quiet: () => ({ text: () => Promise.resolve(runsJson) }) }
-    }) as unknown as ShellFn
-
   const input = {
-    $,
+    $: vi.fn(),
     client: { tui: { showToast } },
     project: {},
     directory: "/tmp/repo",
     worktree: "/tmp/repo",
     serverUrl: "http://localhost:4242",
   } as unknown as Parameters<typeof server>[0]
-
-  return { input, showToast, $ }
+  return { input, showToast }
 }
 
 async function fireIdle(hooks: Awaited<ReturnType<typeof server>>) {
@@ -148,6 +146,8 @@ async function fireIdle(hooks: Awaited<ReturnType<typeof server>>) {
 
 beforeEach(() => {
   runIdCounter = 1
+  vi.restoreAllMocks()
+  execSpy = vi.spyOn(_exec, "exec")
   vi.useFakeTimers()
 })
 
@@ -188,7 +188,6 @@ describe("server — toast on session.idle", () => {
 
     const hooks = await server(input)
     await fireIdle(hooks)
-    // Only drain the immediate tick — don't run the repeating interval
     await vi.runOnlyPendingTimersAsync()
 
     const body = showToast.mock.calls[0][0].body
@@ -256,7 +255,6 @@ describe("server — toast on session.idle", () => {
     await fireIdle(hooks)
     await vi.runOnlyPendingTimersAsync()
 
-    // Second idle should be a no-op since polling already started
     await fireIdle(hooks)
     await vi.runOnlyPendingTimersAsync()
 
@@ -264,31 +262,20 @@ describe("server — toast on session.idle", () => {
   })
 
   it("refreshes the toast every 10 s while a run is active", async () => {
-    // First fetch: in_progress; subsequent fetches: still in_progress with same id
     const activeRun = makeRun({ status: "in_progress", conclusion: null })
-    // Return slightly different updatedAt so the run looks like it is still going
     const updatedRun = { ...activeRun, updatedAt: "2024-01-01T00:02:00Z" }
 
     const showToast = vi.fn().mockResolvedValue(undefined)
-    let callCount = 0
-    const $ = vi
-      .fn()
-      .mockImplementation((strings: TemplateStringsArray, ...args: unknown[]) => {
-        const cmd = strings.raw.join("").trim() + (args.length ? " " + args.join(" ") : "")
-        if (cmd.includes("branch --show-current")) {
-          return { quiet: () => ({ text: () => Promise.resolve("main\n") }) }
-        }
-        if (cmd.includes("rev-parse HEAD")) {
-          return { quiet: () => ({ text: () => Promise.resolve(TEST_HEAD_SHA + "\n") }) }
-        }
-        // First gh call returns activeRun, second returns updatedRun
-        callCount++
-        const payload = callCount === 1 ? [activeRun] : [updatedRun]
-        return { quiet: () => ({ text: () => Promise.resolve(JSON.stringify(payload)) }) }
-      }) as unknown as ShellFn
+    let ghCallCount = 0
+    execSpy.mockImplementation((cmd: string[]) => {
+      if (cmd.includes("branch")) return Promise.resolve("main\n")
+      if (cmd.includes("rev-parse")) return Promise.resolve(TEST_HEAD_SHA + "\n")
+      ghCallCount++
+      return Promise.resolve(JSON.stringify(ghCallCount === 1 ? [activeRun] : [updatedRun]))
+    })
 
     const input = {
-      $,
+      $: vi.fn(),
       client: { tui: { showToast } },
       project: {},
       directory: "/tmp/repo",
@@ -299,12 +286,9 @@ describe("server — toast on session.idle", () => {
     const hooks = await server(input)
     await fireIdle(hooks)
     await vi.runOnlyPendingTimersAsync()
-    // First tick: 1 toast (in_progress)
     expect(showToast).toHaveBeenCalledTimes(1)
 
-    // Advance 10 s to trigger the interval tick — toast key unchanged so no new toast
     await vi.advanceTimersByTimeAsync(10_000)
-    // Still 1 call because variant:summary hasn't changed
     expect(showToast).toHaveBeenCalledTimes(1)
   })
 
@@ -314,25 +298,15 @@ describe("server — toast on session.idle", () => {
 
     const showToast = vi.fn().mockResolvedValue(undefined)
     let ghCallCount = 0
-    const $ = vi
-      .fn()
-      .mockImplementation((strings: TemplateStringsArray, ...args: unknown[]) => {
-        const cmd = strings.raw.join("").trim() + (args.length ? " " + args.join(" ") : "")
-        if (cmd.includes("branch --show-current")) {
-          return { quiet: () => ({ text: () => Promise.resolve("main\n") }) }
-        }
-        if (cmd.includes("rev-parse HEAD")) {
-          return { quiet: () => ({ text: () => Promise.resolve(TEST_HEAD_SHA + "\n") }) }
-        }
-        // First two gh calls return firstRun (watcher prime + tickToast refresh),
-        // subsequent calls return secondRun
-        ghCallCount++
-        const payload = ghCallCount <= 2 ? [firstRun] : [secondRun]
-        return { quiet: () => ({ text: () => Promise.resolve(JSON.stringify(payload)) }) }
-      }) as unknown as ShellFn
+    execSpy.mockImplementation((cmd: string[]) => {
+      if (cmd.includes("branch")) return Promise.resolve("main\n")
+      if (cmd.includes("rev-parse")) return Promise.resolve(TEST_HEAD_SHA + "\n")
+      ghCallCount++
+      return Promise.resolve(JSON.stringify(ghCallCount <= 2 ? [firstRun] : [secondRun]))
+    })
 
     const input = {
-      $,
+      $: vi.fn(),
       client: { tui: { showToast } },
       project: {},
       directory: "/tmp/repo",
@@ -342,21 +316,15 @@ describe("server — toast on session.idle", () => {
 
     const hooks = await server(input)
 
-    // startWatcher fires on init: fetches firstRun, starts polling, shows success toast
     await vi.runOnlyPendingTimersAsync()
     expect(showToast).toHaveBeenCalledTimes(1)
     expect(showToast.mock.calls[0][0].body.variant).toBe("success")
 
-    // session.idle: polling already stopped (run complete); startPolling fires again,
-    // fetches secondRun → dismiss (duration=1) + new error toast
     await fireIdle(hooks)
     await vi.runOnlyPendingTimersAsync()
-    // dismiss call (duration=1) + new toast
     expect(showToast).toHaveBeenCalledTimes(3)
-    const dismissCall = showToast.mock.calls[1][0].body
-    expect(dismissCall.duration).toBe(1)
-    const newToastCall = showToast.mock.calls[2][0].body
-    expect(newToastCall.variant).toBe("error")
+    expect(showToast.mock.calls[1][0].body.duration).toBe(1)
+    expect(showToast.mock.calls[2][0].body.variant).toBe("error")
   })
 })
 
@@ -369,7 +337,6 @@ describe("server — background watcher", () => {
     const runs = [makeRun({ conclusion: "success" })]
     const { input, showToast } = makeInput(runs)
 
-    // Plugin init fires the watcher immediately — no fireIdle needed
     await server(input)
     await vi.runOnlyPendingTimersAsync()
 
@@ -378,7 +345,6 @@ describe("server — background watcher", () => {
   })
 
   it("does not show a toast when no runs exist for HEAD", async () => {
-    // Return runs with a different SHA so filterRunsByCommit returns nothing
     const runs = [makeRun({ headSha: "other-sha" })]
     const { input, showToast } = makeInput(runs)
 
@@ -394,15 +360,13 @@ describe("server — background watcher", () => {
 // ---------------------------------------------------------------------------
 
 describe("server — mockRuns mode", () => {
-  it("shows toasts from mock snapshots without calling gh", async () => {
+  it("shows toasts from mock snapshots without calling exec", async () => {
     const inProgress = makeRun({ status: "in_progress", conclusion: null })
     const completed = makeRun({ ...inProgress, status: "completed", conclusion: "success" })
 
     const showToast = vi.fn().mockResolvedValue(undefined)
-    // Shell should never be called in mock mode
-    const $ = vi.fn() as unknown as ShellFn
     const input = {
-      $,
+      $: vi.fn(),
       client: { tui: { showToast } },
       project: {},
       directory: "/tmp/repo",
@@ -410,18 +374,13 @@ describe("server — mockRuns mode", () => {
       serverUrl: "http://localhost:4242",
     } as unknown as Parameters<typeof server>[0]
 
-    // startWatcher fires watchTick immediately on init, which calls peekRuns
-    // (snapshot 0 = in_progress) and then startPolling → tickToast.
-    // Flush those promises before asserting.
     await server(input, { mockRuns: [[inProgress], [completed]] })
     await vi.advanceTimersByTimeAsync(0)
 
-    // First tick used snapshot 0 (in_progress)
     expect(showToast).toHaveBeenCalledTimes(1)
     expect(showToast.mock.calls[0][0].body.variant).toBe("info")
     expect(showToast.mock.calls[0][0].body.duration).toBe(10_500)
-    // Shell was never called
-    expect($).not.toHaveBeenCalled()
+    expect(execSpy).not.toHaveBeenCalled()
   })
 
   it("advances through snapshots on each poll tick", async () => {
@@ -429,9 +388,8 @@ describe("server — mockRuns mode", () => {
     const completed = { ...inProgress, status: "completed", conclusion: "success" }
 
     const showToast = vi.fn().mockResolvedValue(undefined)
-    const $ = vi.fn() as unknown as ShellFn
     const input = {
-      $,
+      $: vi.fn(),
       client: { tui: { showToast } },
       project: {},
       directory: "/tmp/repo",
@@ -441,11 +399,9 @@ describe("server — mockRuns mode", () => {
 
     await server(input, { mockRuns: [[inProgress], [completed]] })
     await vi.advanceTimersByTimeAsync(0)
-    // tick 0: in_progress toast (from watcher init → startPolling → tickToast)
     expect(showToast).toHaveBeenCalledTimes(1)
     expect(showToast.mock.calls[0][0].body.variant).toBe("info")
 
-    // Advance 10 s — tick 1 uses snapshot 1 (completed/success)
     await vi.advanceTimersByTimeAsync(10_000)
     expect(showToast).toHaveBeenCalledTimes(2)
     expect(showToast.mock.calls[1][0].body.variant).toBe("success")
@@ -456,9 +412,8 @@ describe("server — mockRuns mode", () => {
     const completed = makeRun({ status: "completed", conclusion: "success" })
 
     const showToast = vi.fn().mockResolvedValue(undefined)
-    const $ = vi.fn() as unknown as ShellFn
     const input = {
-      $,
+      $: vi.fn(),
       client: { tui: { showToast } },
       project: {},
       directory: "/tmp/repo",
@@ -466,13 +421,10 @@ describe("server — mockRuns mode", () => {
       serverUrl: "http://localhost:4242",
     } as unknown as Parameters<typeof server>[0]
 
-    // Only one snapshot — watcher fires on init, polling stops after first tick
     await server(input, { mockRuns: [[completed]] })
     await vi.runOnlyPendingTimersAsync()
     expect(showToast).toHaveBeenCalledTimes(1)
 
-    // Advance well past 10 s — polling stopped so no new toasts
-    // (watcher re-fires but poll is still stopped since run is complete)
     await vi.advanceTimersByTimeAsync(30_000)
     expect(showToast).toHaveBeenCalledTimes(1)
   })

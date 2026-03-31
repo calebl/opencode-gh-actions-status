@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from "vitest"
+import { describe, it, expect, vi, beforeEach } from "vitest"
 import {
+  _exec,
   mapStatus,
   formatStatus,
   getCurrentBranch,
@@ -7,7 +8,6 @@ import {
   fetchWorkflowRuns,
   filterRunsByCommit,
   type WorkflowRun,
-  type ShellFn,
 } from "./gh.js"
 
 // ---------------------------------------------------------------------------
@@ -31,12 +31,12 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
   }
 }
 
-/** Build a minimal ShellFn mock that returns the given stdout string. */
-function makeShell(stdout: string): ShellFn {
-  return vi.fn().mockReturnValue({
-    quiet: () => ({ text: () => Promise.resolve(stdout) }),
-  })
-}
+let execSpy: ReturnType<typeof vi.spyOn>
+
+beforeEach(() => {
+  vi.restoreAllMocks()
+  execSpy = vi.spyOn(_exec, "exec")
+})
 
 // ---------------------------------------------------------------------------
 // mapStatus
@@ -126,15 +126,29 @@ describe("formatStatus", () => {
 
 describe("getCurrentBranch", () => {
   it("returns trimmed branch name", async () => {
-    const $ = makeShell("  feature/my-branch\n")
-    expect(await getCurrentBranch($)).toBe("feature/my-branch")
+    execSpy.mockResolvedValue("  feature/my-branch\n")
+    expect(await getCurrentBranch()).toBe("feature/my-branch")
   })
 
-  it("returns empty string when shell throws", async () => {
-    const $ = vi.fn().mockReturnValue({
-      quiet: () => ({ text: () => Promise.reject(new Error("not a git repo")) }),
-    }) as unknown as ShellFn
-    expect(await getCurrentBranch($)).toBe("")
+  it("returns empty string when exec throws", async () => {
+    execSpy.mockRejectedValue(new Error("not a git repo"))
+    expect(await getCurrentBranch()).toBe("")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// getHeadCommitSha
+// ---------------------------------------------------------------------------
+
+describe("getHeadCommitSha", () => {
+  it("returns trimmed commit SHA", async () => {
+    execSpy.mockResolvedValue("  abc123def456\n")
+    expect(await getHeadCommitSha()).toBe("abc123def456")
+  })
+
+  it("returns empty string when exec throws", async () => {
+    execSpy.mockRejectedValue(new Error("not a git repo"))
+    expect(await getHeadCommitSha()).toBe("")
   })
 })
 
@@ -145,15 +159,11 @@ describe("getCurrentBranch", () => {
 describe("fetchWorkflowRuns", () => {
   it("returns parsed runs for the current branch", async () => {
     const runs: WorkflowRun[] = [makeRun({ name: "CI" }), makeRun({ name: "Deploy" })]
-    // First call: git branch, second call: gh run list
-    const $ = vi
-      .fn()
-      .mockReturnValueOnce({ quiet: () => ({ text: () => Promise.resolve("main\n") }) })
-      .mockReturnValueOnce({
-        quiet: () => ({ text: () => Promise.resolve(JSON.stringify(runs)) }),
-      }) as unknown as ShellFn
+    execSpy
+      .mockResolvedValueOnce("main\n")
+      .mockResolvedValueOnce(JSON.stringify(runs))
 
-    const result = await fetchWorkflowRuns($, {})
+    const result = await fetchWorkflowRuns({})
     expect(result).toHaveLength(2)
     expect(result[0].name).toBe("CI")
     expect(result[1].name).toBe("Deploy")
@@ -161,66 +171,36 @@ describe("fetchWorkflowRuns", () => {
 
   it("uses the provided branch instead of current branch", async () => {
     const runs: WorkflowRun[] = [makeRun()]
-    const $ = vi.fn().mockReturnValue({
-      quiet: () => ({ text: () => Promise.resolve(JSON.stringify(runs)) }),
-    }) as unknown as ShellFn
+    execSpy.mockResolvedValueOnce(JSON.stringify(runs))
 
-    const result = await fetchWorkflowRuns($, { branch: "release/1.0" })
-    // getCurrentBranch should NOT be called — only the gh run list call
-    expect($).toHaveBeenCalledTimes(1)
+    const result = await fetchWorkflowRuns({ branch: "release/1.0" })
+    expect(execSpy).toHaveBeenCalledTimes(1)
     expect(result).toHaveLength(1)
   })
 
   it("returns empty array when current branch cannot be determined", async () => {
-    const $ = vi.fn().mockReturnValue({
-      quiet: () => ({ text: () => Promise.resolve("") }),
-    }) as unknown as ShellFn
-
-    const result = await fetchWorkflowRuns($, {})
+    execSpy.mockResolvedValueOnce("")
+    const result = await fetchWorkflowRuns({})
     expect(result).toEqual([])
   })
 
   it("returns empty array when gh returns non-array JSON", async () => {
-    const $ = vi
-      .fn()
-      .mockReturnValueOnce({ quiet: () => ({ text: () => Promise.resolve("main\n") }) })
-      .mockReturnValueOnce({
-        quiet: () => ({ text: () => Promise.resolve(JSON.stringify({ error: "oops" })) }),
-      }) as unknown as ShellFn
+    execSpy
+      .mockResolvedValueOnce("main\n")
+      .mockResolvedValueOnce(JSON.stringify({ error: "oops" }))
 
-    const result = await fetchWorkflowRuns($, {})
+    const result = await fetchWorkflowRuns({})
     expect(result).toEqual([])
   })
 
   it("respects the limit option", async () => {
     const runs = Array.from({ length: 3 }, (_, i) => makeRun({ name: `Run ${i}` }))
-    const $ = vi
-      .fn()
-      .mockReturnValueOnce({ quiet: () => ({ text: () => Promise.resolve("main\n") }) })
-      .mockReturnValueOnce({
-        quiet: () => ({ text: () => Promise.resolve(JSON.stringify(runs)) }),
-      }) as unknown as ShellFn
+    execSpy
+      .mockResolvedValueOnce("main\n")
+      .mockResolvedValueOnce(JSON.stringify(runs))
 
-    const result = await fetchWorkflowRuns($, { limit: 3 })
+    const result = await fetchWorkflowRuns({ limit: 3 })
     expect(result).toHaveLength(3)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// getHeadCommitSha
-// ---------------------------------------------------------------------------
-
-describe("getHeadCommitSha", () => {
-  it("returns trimmed commit SHA", async () => {
-    const $ = makeShell("  abc123def456\n")
-    expect(await getHeadCommitSha($)).toBe("abc123def456")
-  })
-
-  it("returns empty string when shell throws", async () => {
-    const $ = vi.fn().mockReturnValue({
-      quiet: () => ({ text: () => Promise.reject(new Error("not a git repo")) }),
-    }) as unknown as ShellFn
-    expect(await getHeadCommitSha($)).toBe("")
   })
 })
 

@@ -8,7 +8,6 @@ import {
   formatStatus,
   type WorkflowRun,
   type GhOptions,
-  type ShellFn,
 } from "./gh.js"
 
 export interface PluginConfig {
@@ -57,12 +56,13 @@ export function parseOptions(options?: PluginOptions): PluginConfig {
 
 export const server: Plugin = async (input, options) => {
   const config = parseOptions(options)
-  const $ = input.$ as unknown as ShellFn
+  const cwd = input.directory as string | undefined
 
   const ghOptions: GhOptions = {
     branch: config.branch,
     limit: config.limit ?? 5,
     workflows: config.workflows,
+    cwd,
   }
 
   let cachedRuns: WorkflowRun[] = []
@@ -90,7 +90,7 @@ export const server: Plugin = async (input, options) => {
     const now = Date.now()
     if (now - lastFetch > pollInterval) {
       if (!fetchPromise) {
-        fetchPromise = fetchWorkflowRuns($, ghOptions)
+        fetchPromise = fetchWorkflowRuns(ghOptions)
           .then((runs) => {
             cachedRuns = runs
             lastFetchError = null
@@ -244,7 +244,7 @@ export const server: Plugin = async (input, options) => {
     // Filter to only runs for the current HEAD commit (skip in mock mode)
     let commitRuns = runs
     if (mockSnapshots === null) {
-      const headSha = await getHeadCommitSha($)
+      const headSha = await getHeadCommitSha(cwd)
       if (headSha) commitRuns = filterRunsByCommit(runs, headSha)
     }
 
@@ -309,7 +309,7 @@ export const server: Plugin = async (input, options) => {
     // Check if there are any runs for the current HEAD commit
     let commitRuns = runs
     if (mockSnapshots === null) {
-      const headSha = await getHeadCommitSha($)
+      const headSha = await getHeadCommitSha(cwd)
       if (!headSha || filterRunsByCommit(runs, headSha).length === 0) return
       commitRuns = filterRunsByCommit(runs, headSha)
     }
@@ -368,7 +368,7 @@ export const server: Plugin = async (input, options) => {
           if (lastFetchError) {
             return [{ label: `Error: ${lastFetchError}`, status: "error" as const }]
           }
-          const headSha = await getHeadCommitSha($)
+          const headSha = await getHeadCommitSha(cwd)
           const commitRuns = headSha ? filterRunsByCommit(runs, headSha) : runs
           if (commitRuns.length === 0) {
             return [{ label: "No workflow runs found for current commit" }]
@@ -402,10 +402,11 @@ export const server: Plugin = async (input, options) => {
         async execute(args) {
           let runs: WorkflowRun[]
           try {
-            runs = await fetchWorkflowRuns($, {
+            runs = await fetchWorkflowRuns({
               branch: args.branch ?? ghOptions.branch,
               limit: args.limit ?? ghOptions.limit,
               workflows: ghOptions.workflows,
+              cwd,
             })
           } catch (err: unknown) {
             const message = err instanceof Error ? err.message : "Unknown error"
@@ -413,7 +414,7 @@ export const server: Plugin = async (input, options) => {
           }
 
           // Filter to only runs for the current HEAD commit
-          const headSha = await getHeadCommitSha($)
+          const headSha = await getHeadCommitSha(cwd)
           const commitRuns = headSha ? filterRunsByCommit(runs, headSha) : runs
 
           if (commitRuns.length === 0) {
