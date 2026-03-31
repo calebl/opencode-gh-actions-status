@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest"
 import { resolve, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import { _exec } from "./gh.js"
-import { parseOptions, server } from "./server.js"
+import { parseOptions, server, formatRunResults } from "./server.js"
 import type { WorkflowRun } from "./gh.js"
 
 // ---------------------------------------------------------------------------
@@ -81,6 +81,40 @@ describe("parseOptions", () => {
 
   it("ignores non-array mockRuns", () => {
     expect(parseOptions({ mockRuns: "not-an-array" })).toMatchObject({ mockRuns: undefined })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// formatRunResults
+// ---------------------------------------------------------------------------
+
+describe("formatRunResults", () => {
+  it("returns no-runs message for empty array", () => {
+    expect(formatRunResults([], [])).toMatch(/no workflow runs/i)
+  })
+
+  it("formats runs with status icons", () => {
+    const runs: WorkflowRun[] = [
+      { databaseId: 1, name: "CI", status: "completed", conclusion: "success", headBranch: "main", headSha: "abc", event: "push", url: "https://example.com/1", displayTitle: "commit", createdAt: "", updatedAt: "" },
+      { databaseId: 2, name: "Deploy", status: "completed", conclusion: "failure", headBranch: "main", headSha: "abc", event: "push", url: "https://example.com/2", displayTitle: "commit", createdAt: "", updatedAt: "" },
+    ]
+    const result = formatRunResults(runs, [])
+    expect(result).toContain("✓ CI: success")
+    expect(result).toContain("✗ Deploy: failure")
+  })
+
+  it("includes review threads when present", () => {
+    const runs: WorkflowRun[] = [
+      { databaseId: 1, name: "CI", status: "completed", conclusion: "success", headBranch: "main", headSha: "abc", event: "push", url: "https://example.com/1", displayTitle: "commit", createdAt: "", updatedAt: "" },
+    ]
+    const threads = [
+      { path: "src/foo.ts", line: 10, diffSide: "RIGHT", comments: [{ author: "bob", body: "Fix this", createdAt: "2024-01-01", url: "https://example.com/c1" }] },
+    ]
+    const result = formatRunResults(runs, threads)
+    expect(result).toContain("Unresolved Review Comments (1)")
+    expect(result).toContain("src/foo.ts:10")
+    expect(result).toContain("bob")
+    expect(result).toContain("Fix this")
   })
 })
 
@@ -689,5 +723,206 @@ describe("server — session compacting hook", () => {
     expect(output.context.length).toBe(1)
     expect(output.context[0]).toContain("gh-actions-status")
     expect(output.context[0]).toContain("gh_actions")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// server — post-push CI prompt
+// ---------------------------------------------------------------------------
+
+describe("server — tool.execute.after detects git push", () => {
+  it("detects 'git push' in tool args", async () => {
+    const runs = [makeRun({ conclusion: "success" })]
+    const { input } = makeInput(runs)
+    const hooks = await server(input)
+
+    const afterHook = hooks["tool.execute.after"]!
+    await afterHook(
+      { tool: "Bash", sessionID: "sess-1", callID: "c1", args: { command: "git push -u origin main" } },
+      { title: "", output: "", metadata: {} },
+    )
+
+    // The hook should have stored the session ID internally.
+    // We verify this indirectly: when runs complete, the session gets prompted.
+    // (Direct state inspection tested in the prompt tests below.)
+    expect(afterHook).toBeDefined()
+  })
+
+  it("ignores non-push commands", async () => {
+    const runs = [makeRun({ conclusion: "success" })]
+    const { input } = makeInput(runs)
+    const hooks = await server(input)
+
+    const afterHook = hooks["tool.execute.after"]!
+    // Should not throw for unrelated commands
+    await afterHook(
+      { tool: "Bash", sessionID: "sess-1", callID: "c1", args: { command: "git status" } },
+      { title: "", output: "", metadata: {} },
+    )
+    expect(afterHook).toBeDefined()
+  })
+})
+
+describe("server — prompts session with CI results after push", () => {
+  it("sends a prompt with run results when CI completes after a push", async () => {
+    const inProgress = makeRun({ status: "in_progress", conclusion: null })
+    const completed = { ...inProgress, status: "completed", conclusion: "success" }
+
+    const showToast = vi.fn().mockResolvedValue(undefined)
+    const sessionPrompt = vi.fn().mockResolvedValue({})
+    let ghCallCount = 0
+    execSpy.mockImplementation((cmd: string[]) => {
+      if (cmd.includes("branch") && !cmd.includes("gh")) return Promise.resolve("main\n")
+      if (cmd.includes("rev-parse")) return Promise.resolve(TEST_HEAD_SHA + "\n")
+      if (cmd.includes("remote")) return Promise.resolve("git@github.com:owner/repo.git\n")
+      if (cmd.includes("pr")) return Promise.reject(new Error("no PR"))
+      if (cmd.includes("graphql")) return Promise.resolve(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }))
+      ghCallCount++
+      // First fetch: in_progress, subsequent: completed
+      return Promise.resolve(JSON.stringify(ghCallCount <= 2 ? [inProgress] : [completed]))
+    })
+
+    const input = {
+      $: vi.fn(),
+      client: { tui: { showToast }, session: { prompt: sessionPrompt } },
+      project: {},
+      directory: "/tmp/repo",
+      worktree: "/tmp/repo",
+      serverUrl: "http://localhost:4242",
+    } as unknown as Parameters<typeof server>[0]
+
+    const hooks = await server(input)
+
+    // Simulate the agent running git push
+    await hooks["tool.execute.after"]!(
+      { tool: "Bash", sessionID: "sess-push", callID: "c1", args: "git push -u origin main" },
+      { title: "", output: "", metadata: {} },
+    )
+
+    // Let the watcher and poll loop run until CI completes
+    await vi.advanceTimersByTimeAsync(0) // watcher tick
+    await vi.advanceTimersByTimeAsync(10_000) // first poll (in_progress)
+    await vi.advanceTimersByTimeAsync(10_000) // second poll (completed)
+
+    // Give the prompt call time to resolve
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(sessionPrompt).toHaveBeenCalledOnce()
+    const promptArgs = sessionPrompt.mock.calls[0][0]
+    expect(promptArgs.sessionID).toBe("sess-push")
+    expect(promptArgs.parts).toHaveLength(1)
+    expect(promptArgs.parts[0].type).toBe("text")
+    expect(promptArgs.parts[0].synthetic).toBe(true)
+    expect(promptArgs.parts[0].text).toContain("Workflow Runs")
+    expect(promptArgs.parts[0].text).toContain("success")
+  })
+
+  it("does NOT prompt when no push was detected", async () => {
+    const runs = [makeRun({ conclusion: "success" })]
+    const showToast = vi.fn().mockResolvedValue(undefined)
+    const sessionPrompt = vi.fn().mockResolvedValue({})
+
+    setupExecMock(runs)
+    const input = {
+      $: vi.fn(),
+      client: { tui: { showToast }, session: { prompt: sessionPrompt } },
+      project: {},
+      directory: "/tmp/repo",
+      worktree: "/tmp/repo",
+      serverUrl: "http://localhost:4242",
+    } as unknown as Parameters<typeof server>[0]
+
+    await server(input)
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(sessionPrompt).not.toHaveBeenCalled()
+  })
+
+  it("includes unresolved review comments in the push prompt", async () => {
+    const completed = makeRun({ conclusion: "success" })
+    const graphqlResponse = JSON.stringify({
+      data: { repository: { pullRequest: { reviewThreads: { nodes: [
+        {
+          isResolved: false,
+          path: "src/foo.ts",
+          line: 42,
+          diffSide: "RIGHT",
+          comments: { nodes: [{
+            author: { login: "alice" },
+            body: "Please fix this",
+            createdAt: "2024-01-01T00:00:00Z",
+            url: "https://github.com/owner/repo/pull/1#discussion_r1",
+          }] },
+        },
+      ] } } } },
+    })
+
+    const showToast = vi.fn().mockResolvedValue(undefined)
+    const sessionPrompt = vi.fn().mockResolvedValue({})
+    execSpy.mockImplementation((cmd: string[]) => {
+      if (cmd.includes("branch") && !cmd.includes("gh")) return Promise.resolve("main\n")
+      if (cmd.includes("rev-parse")) return Promise.resolve(TEST_HEAD_SHA + "\n")
+      if (cmd.includes("remote")) return Promise.resolve("git@github.com:owner/repo.git\n")
+      if (cmd.includes("pr")) return Promise.resolve(JSON.stringify({ number: 1 }))
+      if (cmd.includes("graphql")) return Promise.resolve(graphqlResponse)
+      return Promise.resolve(JSON.stringify([completed]))
+    })
+
+    const input = {
+      $: vi.fn(),
+      client: { tui: { showToast }, session: { prompt: sessionPrompt } },
+      project: {},
+      directory: "/tmp/repo",
+      worktree: "/tmp/repo",
+      serverUrl: "http://localhost:4242",
+    } as unknown as Parameters<typeof server>[0]
+
+    const hooks = await server(input)
+
+    // Simulate push
+    await hooks["tool.execute.after"]!(
+      { tool: "Bash", sessionID: "sess-review", callID: "c1", args: "git push" },
+      { title: "", output: "", metadata: {} },
+    )
+
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(sessionPrompt).toHaveBeenCalledOnce()
+    const text = sessionPrompt.mock.calls[0][0].parts[0].text
+    expect(text).toContain("Unresolved Review Comments (1)")
+    expect(text).toContain("src/foo.ts:42")
+    expect(text).toContain("alice")
+    expect(text).toContain("Please fix this")
+  })
+
+  it("clears pending push after prompting (no double-prompt)", async () => {
+    const completed = makeRun({ conclusion: "success" })
+    const showToast = vi.fn().mockResolvedValue(undefined)
+    const sessionPrompt = vi.fn().mockResolvedValue({})
+
+    setupExecMock([completed])
+    const input = {
+      $: vi.fn(),
+      client: { tui: { showToast }, session: { prompt: sessionPrompt } },
+      project: {},
+      directory: "/tmp/repo",
+      worktree: "/tmp/repo",
+      serverUrl: "http://localhost:4242",
+    } as unknown as Parameters<typeof server>[0]
+
+    const hooks = await server(input)
+
+    // First push
+    await hooks["tool.execute.after"]!(
+      { tool: "Bash", sessionID: "sess-1", callID: "c1", args: "git push" },
+      { title: "", output: "", metadata: {} },
+    )
+    await vi.runOnlyPendingTimersAsync()
+    expect(sessionPrompt).toHaveBeenCalledOnce()
+
+    // Trigger another idle — should NOT prompt again
+    await fireIdle(hooks)
+    await vi.runOnlyPendingTimersAsync()
+    expect(sessionPrompt).toHaveBeenCalledOnce()
   })
 })

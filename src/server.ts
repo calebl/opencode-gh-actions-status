@@ -70,6 +70,41 @@ function getSkillsDir(): string {
   return resolve(thisDir, "..", "skills")
 }
 
+/**
+ * Format workflow runs and review threads into a readable report.
+ * Shared between the gh_actions tool and the post-push prompt.
+ */
+export function formatRunResults(runs: WorkflowRun[], threads: ReviewThread[]): string {
+  if (runs.length === 0) {
+    return "No workflow runs found for the current commit."
+  }
+
+  const lines = runs.map((run) => {
+    const status = formatStatus(run)
+    const level = mapStatus(run)
+    const icon =
+      level === "success" ? "✓" : level === "error" ? "✗" : level === "warning" ? "⚠" : "●"
+    return `${icon} ${run.name}: ${status} (${run.displayTitle})\n  ${run.url}`
+  })
+
+  const output: string[] = ["## Workflow Runs", lines.join("\n\n")]
+
+  if (threads.length > 0) {
+    output.push(`\n## Unresolved Review Comments (${threads.length})`)
+    for (const thread of threads) {
+      const location = thread.line
+        ? `${thread.path}:${thread.line}`
+        : thread.path
+      output.push(`\n### ${location}`)
+      for (const comment of thread.comments) {
+        output.push(`**${comment.author}** (${comment.createdAt}):\n${comment.body}\n${comment.url}`)
+      }
+    }
+  }
+
+  return output.join("\n")
+}
+
 const SKILLS_SYSTEM_PROMPT =
   "The gh-actions-status plugin provides a `gh_actions` tool. " +
   "Use it to check GitHub Actions workflow run statuses and unresolved PR review comments " +
@@ -192,6 +227,9 @@ export const server: Plugin = async (input, options) => {
   let watchHandle: unknown = null
   // Last HEAD SHA seen by the watcher — used to detect new pushes immediately
   let lastSeenSha = ""
+  // Session ID that triggered a git push — when set, the plugin will prompt
+  // that session with CI results once runs reach a final state.
+  let pendingPushSessionID: string | null = null
 
   function isRunActive(runs: WorkflowRun[]): boolean {
     return runs.some(
@@ -270,6 +308,28 @@ export const server: Plugin = async (input, options) => {
     }
   }
 
+  /**
+   * After a detected git push, prompt the originating session with the final
+   * CI results so the agent can act on failures or review comments.
+   */
+  async function promptSessionWithResults(sessionID: string, commitRuns: WorkflowRun[]) {
+    const threads = mockSnapshots === null ? await fetchUnresolvedThreads(cwd) : []
+    const text = formatRunResults(commitRuns, threads)
+    try {
+      // The client exposes session.prompt() at runtime (SDK v2) but the
+      // published @opencode-ai/plugin types may not surface it yet.
+      const session = (client as unknown as {
+        session: { prompt: (args: Record<string, unknown>) => Promise<unknown> }
+      }).session
+      await session.prompt({
+        sessionID,
+        parts: [{ type: "text", text, synthetic: true }],
+      })
+    } catch {
+      // Session may have been closed or agent may be busy — silently skip.
+    }
+  }
+
   async function tickToast() {
     let runs: WorkflowRun[]
     try {
@@ -324,6 +384,12 @@ export const server: Plugin = async (input, options) => {
     if (!active) {
       // Run has finished – no need to keep polling
       stopPolling()
+      // If a git push was detected, prompt the originating session with results.
+      if (pendingPushSessionID !== null) {
+        const sid = pendingPushSessionID
+        pendingPushSessionID = null
+        void promptSessionWithResults(sid, commitRuns)
+      }
     }
   }
 
@@ -463,6 +529,17 @@ export const server: Plugin = async (input, options) => {
       )
     },
 
+    // Detect agent-initiated git push commands so we can automatically prompt
+    // the session with CI results once all runs reach a final state.
+    "tool.execute.after": async (input, _output) => {
+      const args = typeof input.args === "string"
+        ? input.args
+        : JSON.stringify(input.args ?? "")
+      if (/\bgit\s+push\b/.test(args)) {
+        pendingPushSessionID = input.sessionID
+      }
+    },
+
     sidebar: [
       {
         id: "gh-actions",
@@ -518,40 +595,10 @@ export const server: Plugin = async (input, options) => {
             return `Failed to fetch workflow runs: ${message}`
           }
 
-          // Filter to only runs for the current HEAD commit
           const headSha = await getHeadCommitSha(cwd)
           const commitRuns = headSha ? filterRunsByCommit(runs, headSha) : runs
-
-          if (commitRuns.length === 0) {
-            return "No workflow runs found for the current commit."
-          }
-
-          const lines = commitRuns.map((run) => {
-            const status = formatStatus(run)
-            const level = mapStatus(run)
-            const icon =
-              level === "success" ? "✓" : level === "error" ? "✗" : level === "warning" ? "⚠" : "●"
-            return `${icon} ${run.name}: ${status} (${run.displayTitle})\n  ${run.url}`
-          })
-
-          const output: string[] = ["## Workflow Runs", lines.join("\n\n")]
-
-          // Fetch unresolved PR review threads
           const threads = await fetchUnresolvedThreads(cwd)
-          if (threads.length > 0) {
-            output.push(`\n## Unresolved Review Comments (${threads.length})`)
-            for (const thread of threads) {
-              const location = thread.line
-                ? `${thread.path}:${thread.line}`
-                : thread.path
-              output.push(`\n### ${location}`)
-              for (const comment of thread.comments) {
-                output.push(`**${comment.author}** (${comment.createdAt}):\n${comment.body}\n${comment.url}`)
-              }
-            }
-          }
-
-          return output.join("\n")
+          return formatRunResults(commitRuns, threads)
         },
       }),
     },
