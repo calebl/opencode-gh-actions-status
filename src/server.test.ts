@@ -56,6 +56,14 @@ describe("parseOptions", () => {
     expect(parseOptions({ pollInterval: "15000" })).toMatchObject({ pollInterval: undefined })
   })
 
+  it("extracts valid watchInterval", () => {
+    expect(parseOptions({ watchInterval: 5000 })).toMatchObject({ watchInterval: 5000 })
+  })
+
+  it("ignores non-number watchInterval", () => {
+    expect(parseOptions({ watchInterval: "5000" })).toMatchObject({ watchInterval: undefined })
+  })
+
   it("extracts valid mockRuns array", () => {
     const snapshot = [{ databaseId: 1, name: "CI", status: "in_progress", conclusion: null,
       headBranch: "main", event: "push", url: "https://github.com/x/y/runs/1",

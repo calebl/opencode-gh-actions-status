@@ -16,6 +16,7 @@ export interface PluginConfig {
   limit?: number
   workflows?: string[]
   pollInterval?: number
+  watchInterval?: number
   /**
    * When set, the plugin returns these runs instead of calling `gh`.
    * Each element is a snapshot; the plugin cycles through them on each poll
@@ -46,6 +47,8 @@ export function parseOptions(options?: PluginOptions): PluginConfig {
       : undefined,
     pollInterval:
       typeof options.pollInterval === "number" ? options.pollInterval : undefined,
+    watchInterval:
+      typeof options.watchInterval === "number" ? options.watchInterval : undefined,
     mockRuns: Array.isArray(options.mockRuns)
       ? (options.mockRuns as WorkflowRun[][]).filter(Array.isArray)
       : undefined,
@@ -65,6 +68,8 @@ export const server: Plugin = async (input, options) => {
   let cachedRuns: WorkflowRun[] = []
   let lastFetch = 0
   const pollInterval = config.pollInterval ?? 30_000
+  // How often the background watcher checks for new runs (independent of cache TTL)
+  const watchInterval = config.watchInterval ?? 5_000
   let fetchPromise: Promise<WorkflowRun[]> | null = null
   let lastFetchError: string | null = null
 
@@ -107,22 +112,16 @@ export const server: Plugin = async (input, options) => {
   }
 
   /**
-   * Lightweight peek used by the watcher: returns the current cache without
-   * advancing the mock index or triggering an extra fetch.
-   * In real mode it returns cached data (possibly stale); tickToast is
-   * responsible for doing a fresh fetch when it actually runs.
+   * Lightweight peek used by the watcher: returns runs without advancing the
+   * mock index. In real mode it delegates to getRuns() which respects the
+   * pollInterval cache TTL, so at most one gh call per pollInterval window.
    */
   async function peekRuns(): Promise<WorkflowRun[]> {
     if (mockSnapshots !== null) {
       // In mock mode return the current snapshot without advancing the index
       return mockSnapshots[Math.min(mockIndex, mockSnapshots.length - 1)]
     }
-    // Return the current cache. If empty, do a single fetch to prime it so
-    // the watcher can detect whether any runs exist on startup.
-    if (cachedRuns.length === 0 && lastFetch === 0) {
-      return getRuns()
-    }
-    return cachedRuns
+    return getRuns()
   }
 
   const client = input.client
@@ -325,9 +324,9 @@ export const server: Plugin = async (input, options) => {
 
   function startWatcher() {
     if (watchHandle !== null) return // already running
-    // Fire once immediately, then repeat on the poll interval
+    // Fire once immediately, then repeat on the watch interval
     void watchTick()
-    watchHandle = _setInterval(() => void watchTick(), pollInterval)
+    watchHandle = _setInterval(() => void watchTick(), watchInterval)
   }
 
   // The sidebar hook is supported at runtime but not yet in the published
