@@ -183,14 +183,22 @@ async function firePush(hooks: Awaited<ReturnType<typeof server>>, sessionID = "
 }
 
 /**
- * Advance fake timers by `ms` and flush microtasks so that async callbacks
- * triggered by timers (awaits inside tickToast etc.) also complete.
- * Bun's vitest compat layer does not support the *Async timer variants.
+ * Advance fake timers and flush all async chains triggered by them.
+ *
+ * vitest 4.x (native) supports vi.advanceTimersByTimeAsync which correctly
+ * interleaves timer callbacks with microtask flushes — use it when available.
+ * Bun's vitest compat layer only has the sync variant, so we fall back to
+ * manually flushing the microtask queue after a sync advance.
  */
 async function drainTimers(ms = 120_000) {
-  vi.advanceTimersByTime(ms)
-  // Flush microtask queue multiple times to let async chains resolve
-  for (let i = 0; i < 10; i++) await Promise.resolve()
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const asyncAdvance = (vi as any).advanceTimersByTimeAsync
+  if (typeof asyncAdvance === "function") {
+    await asyncAdvance.call(vi, ms)
+  } else {
+    vi.advanceTimersByTime(ms)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+  }
 }
 
 // ---------------------------------------------------------------------------
