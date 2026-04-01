@@ -4,7 +4,7 @@ An [OpenCode](https://opencode.ai) plugin that surfaces GitHub Actions workflow 
 
 ## Features
 
-- **Instant push detection**: Shows a "Waiting for CI..." toast the moment you push — before GitHub has even queued the run
+- **Instant push detection**: Shows a "Waiting for CI..." toast the moment the agent runs `git push` — before GitHub has even queued the run
 - **Live status updates**: Transitions through `Waiting for CI...` → `1 running` → `1 passing` (or `1 failing`) as the run progresses
 - **Post-push agent prompt**: When the agent runs `git push` and CI completes, the plugin automatically prompts the agent with the full run results and any unresolved review comments so it can react autonomously — fixing failures or addressing feedback without being asked
 - **Unresolved comment count**: Toast includes a count of unresolved PR review threads so you always know if there is feedback waiting
@@ -38,8 +38,8 @@ Pass options as a tuple:
       "branch": "main",
       "limit": 10,
       "workflows": ["ci.yml", "deploy.yml"],
-      "pollInterval": 30000,
-      "watchInterval": 5000
+      "pollInterval": 60000,
+      "toastInterval": 30000
     }]
   ]
 }
@@ -50,18 +50,18 @@ Pass options as a tuple:
 | `branch` | `string` | `"current"` | Branch to check. `"current"` uses the active git branch. |
 | `limit` | `number` | `5` | Maximum number of workflow runs to display. |
 | `workflows` | `string[]` | all | Filter to specific workflow files. |
-| `pollInterval` | `number` | `30000` | Cache TTL in ms for `gh run list` results. |
-| `watchInterval` | `number` | `5000` | How often (ms) the background watcher checks for new runs and push events. |
+| `pollInterval` | `number` | `60000` | Cache TTL in ms for `gh run list` results used by the sidebar. |
+| `toastInterval` | `number` | `30000` | How often (ms) the toast poll loop fires while CI runs are active after a push. |
 
 ## How it works
 
-The plugin runs a background watcher on `watchInterval` (default 5s) that:
+The plugin makes **no GitHub API calls at rest**. All polling is triggered exclusively by a `git push`:
 
-1. Detects when `HEAD` changes (new push) and immediately shows a "Waiting for CI..." toast
-2. Polls `gh run list` for runs matching the current HEAD commit SHA
-3. Once a run appears, starts a fast 10s poll loop that updates the toast through each state transition
-4. On completion, shows the final result with a 30-minute toast duration
-5. If the push was initiated by the agent (detected via the `tool.execute.after` hook), prompts the agent session with the full CI report so it can autonomously react to failures or review comments
+1. The `tool.execute.after` hook detects when the agent runs `git push`
+2. An immediate "Waiting for CI..." toast is shown before GitHub has queued the run
+3. A poll loop starts, calling `gh run list` on `toastInterval` (default 30s) and updating the toast through each state transition
+4. On completion, the final result toast is shown with a 30-minute duration and polling stops
+5. The agent session is automatically prompted with the full CI report — including unresolved review comments — so it can autonomously react to failures or reviewer feedback
 
 The toast message format:
 
